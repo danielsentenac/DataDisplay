@@ -1,0 +1,15 @@
+[package]
+name = "dd-io-hdf5"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+dd-backend = { path = "../dd-backend" }
+dd-domain = { path = "../dd-domain" }
+dd-processing = { path = "../dd-processing" }
+hdf5-reader = "0.1.4"
+ndarray = "0.17.2"
+
+[lib]
+path = "src/lib.rs"

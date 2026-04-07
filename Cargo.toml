@@ -1,0 +1,17 @@
+[workspace]
+members = [
+  "crates/dd-domain",
+  "crates/dd-backend",
+  "crates/dd-processing",
+  "crates/dd-render",
+  "crates/dd-io-hdf5",
+  "crates/dd-io-gwf",
+  "crates/dd-ffi",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+license = "MIT OR Apache-2.0"
+version = "0.1.0"
+

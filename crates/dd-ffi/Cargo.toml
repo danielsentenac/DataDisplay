@@ -1,0 +1,17 @@
+[package]
+name = "dd-ffi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+dd-backend = { path = "../dd-backend" }
+dd-domain = { path = "../dd-domain" }
+dd-io-hdf5 = { path = "../dd-io-hdf5" }
+dd-io-gwf = { path = "../dd-io-gwf" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[lib]
+path = "src/lib.rs"
+crate-type = ["rlib", "cdylib"]

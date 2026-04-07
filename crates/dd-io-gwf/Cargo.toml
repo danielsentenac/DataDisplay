@@ -1,0 +1,16 @@
+[package]
+name = "dd-io-gwf"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+build = "build.rs"
+
+[dependencies]
+dd-backend = { path = "../dd-backend" }
+dd-domain = { path = "../dd-domain" }
+
+[build-dependencies]
+cc = "1.2"
+
+[lib]
+path = "src/lib.rs"

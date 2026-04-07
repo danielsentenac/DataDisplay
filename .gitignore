@@ -1,0 +1,14 @@
+target/
+build/
+dist/
+.tmp/
+data/
+conda-forge-staged-recipes-gwtc_analysis-v0.3.4/
+.codex
+.dart_tool/
+.flutter-plugins
+.flutter-plugins-dependencies
+.packages
+.idea/
+.vscode/
+*.iml
