@@ -1,11 +1,21 @@
 import 'dart:async';
+import 'dart:convert' as dart_convert;
+import 'dart:io' as io;
 import 'dart:math' as math;
+import 'dart:ui' as ui;
 
 import 'package:flutter/material.dart';
+import 'package:flutter/rendering.dart';
 import 'package:flutter/services.dart';
+
+import 'package:http/http.dart' as http;
+import 'package:image/image.dart' as img;
+import 'package:pdf/pdf.dart' as pdf_core;
+import 'package:pdf/widgets.dart' as pw;
 
 import 'src/datadisplay_backend.dart';
 import 'src/native_datadisplay_backend.dart';
+import 'src/tomcat_live_poller.dart';
 
 const _defaultSourceUri =
     'gwf:///home/sentenac/DATADISPLAY/data/V-raw-1446446000-100.gwf?series=raw';
@@ -198,6 +208,7 @@ class WorkspaceController extends ChangeNotifier {
   SeriesViewport? _seriesViewport;
   List<SeriesDeckEntry> _seriesDeck = const [];
   SeriesDeckLayout _seriesDeckLayout = SeriesDeckLayout.overlay;
+  bool _seriesDeckLogY = false;
   Set<String> _selectedSeriesForDeck = const <String>{};
   SeriesDeckViewport? _seriesDeckViewport;
   Map<String, SeriesDeckViewport> _stackedSeriesDeckViewports = const {};
@@ -233,6 +244,7 @@ class WorkspaceController extends ChangeNotifier {
   SeriesViewport? get seriesViewport => _seriesViewport;
   List<SeriesDeckEntry> get seriesDeck => _seriesDeck;
   SeriesDeckLayout get seriesDeckLayout => _seriesDeckLayout;
+  bool get seriesDeckLogY => _seriesDeckLogY;
   Set<String> get selectedSeriesForDeck => _selectedSeriesForDeck;
   SeriesDeckViewport? get seriesDeckViewport => _seriesDeckViewport;
   bool get seriesDeckAutoXEnabled {
@@ -243,11 +255,16 @@ class WorkspaceController extends ChangeNotifier {
       return _seriesDeck.every(
         (entry) =>
             (stackedSeriesDeckViewportFor(entry.stream.channel.id) ??
-                    _autoSeriesDeckViewportForEntry(entry))
+                    _autoSeriesDeckViewportForEntry(
+                      entry,
+                      logY: _seriesDeckLogY,
+                    ))
                 .autoX,
       );
     }
-    return (_seriesDeckViewport ?? _autoSeriesDeckViewport(_seriesDeck)).autoX;
+    return (_seriesDeckViewport ??
+            _autoSeriesDeckViewport(_seriesDeck, logY: _seriesDeckLogY))
+        .autoX;
   }
 
   bool get seriesDeckAutoYEnabled {
@@ -258,11 +275,16 @@ class WorkspaceController extends ChangeNotifier {
       return _seriesDeck.every(
         (entry) =>
             (stackedSeriesDeckViewportFor(entry.stream.channel.id) ??
-                    _autoSeriesDeckViewportForEntry(entry))
+                    _autoSeriesDeckViewportForEntry(
+                      entry,
+                      logY: _seriesDeckLogY,
+                    ))
                 .autoY,
       );
     }
-    return (_seriesDeckViewport ?? _autoSeriesDeckViewport(_seriesDeck)).autoY;
+    return (_seriesDeckViewport ??
+            _autoSeriesDeckViewport(_seriesDeck, logY: _seriesDeckLogY))
+        .autoY;
   }
 
   String get catalogSearch => _catalogSearch;
@@ -583,14 +605,22 @@ class WorkspaceController extends ChangeNotifier {
     }
     final currentViewport = _seriesDeckViewport;
     _seriesDeckViewport = currentViewport == null
-        ? _autoSeriesDeckViewport(_seriesDeck)
-        : _normalizeSeriesDeckViewport(_seriesDeck, currentViewport);
+        ? _autoSeriesDeckViewport(_seriesDeck, logY: _seriesDeckLogY)
+        : _normalizeSeriesDeckViewport(
+            _seriesDeck,
+            currentViewport,
+            logY: _seriesDeckLogY,
+          );
     final nextStackedViewports = <String, SeriesDeckViewport>{};
     for (final entry in _seriesDeck) {
       final current = _stackedSeriesDeckViewports[entry.stream.channel.id];
       nextStackedViewports[entry.stream.channel.id] = current == null
-          ? _autoSeriesDeckViewportForEntry(entry)
-          : _normalizeSeriesDeckViewportForEntry(entry, current);
+          ? _autoSeriesDeckViewportForEntry(entry, logY: _seriesDeckLogY)
+          : _normalizeSeriesDeckViewportForEntry(
+              entry,
+              current,
+              logY: _seriesDeckLogY,
+            );
     }
     _stackedSeriesDeckViewports = nextStackedViewports;
   }
@@ -601,7 +631,7 @@ class WorkspaceController extends ChangeNotifier {
       return null;
     }
     return _stackedSeriesDeckViewports[channelId] ??
-        _autoSeriesDeckViewportForEntry(entry);
+        _autoSeriesDeckViewportForEntry(entry, logY: _seriesDeckLogY);
   }
 
   SeriesDeckEntry? _seriesDeckEntryByChannelId(String channelId) {
@@ -834,11 +864,98 @@ class WorkspaceController extends ChangeNotifier {
     notifyListeners();
   }
 
+  /// Exports the current deck to an ASCII file with one block per channel.
+  /// Each block has a header comment then `<gps_seconds>\t<value>` lines.
+  /// Returns the absolute path of the written file, or null on failure.
+  Future<String?> exportDeckAsAscii() async {
+    if (_seriesDeck.isEmpty) {
+      _setError('Plot deck is empty — add channels before exporting.');
+      return null;
+    }
+    try {
+      final dir = _resolveExportDirectory();
+      final stamp = DateTime.now()
+          .toUtc()
+          .toIso8601String()
+          .replaceAll(':', '')
+          .replaceAll('-', '')
+          .split('.')
+          .first;
+      final file = io.File('${dir.path}/datadisplay-$stamp.txt');
+      final buffer = StringBuffer();
+      buffer.writeln(
+        '# DATADISPLAY ASCII export ${DateTime.now().toUtc().toIso8601String()}',
+      );
+      buffer.writeln('# source: ${_source?.uri ?? "unknown"}');
+      buffer.writeln('# channels: ${_seriesDeck.length}');
+      buffer.writeln('# format: blocks of <gps_seconds>\\t<value> per channel');
+      buffer.writeln('#');
+      for (final entry in _seriesDeck) {
+        final ch = entry.stream.channel;
+        final series = entry.series;
+        final unit = ch.unit == null || ch.unit!.isEmpty ? '-' : ch.unit!;
+        final rate = ch.sampleRateHz?.toString() ?? '-';
+        buffer.writeln('# channel: ${ch.id}');
+        buffer.writeln('# display_name: ${ch.displayName}');
+        buffer.writeln('# unit: $unit');
+        buffer.writeln('# sample_rate_hz: $rate');
+        buffer.writeln('# samples: ${series.values.length}');
+        for (var i = 0; i < series.values.length; i++) {
+          final tNs = _seriesTimestampNs(series, i);
+          final tSec = tNs / 1.0e9;
+          final v = series.values[i];
+          final vStr = v.isFinite ? v.toString() : 'NaN';
+          buffer.writeln('${tSec.toStringAsFixed(9)}\t$vStr');
+        }
+        buffer.writeln();
+      }
+      await file.writeAsString(buffer.toString());
+      _infoMessage = 'Exported deck to ${file.path}';
+      _clearError();
+      notifyListeners();
+      return file.path;
+    } catch (error) {
+      _setError('ASCII export failed: $error');
+      return null;
+    }
+  }
+
+  io.Directory _resolveExportDirectory() {
+    final env = io.Platform.environment;
+    final home = env['HOME'] ?? env['USERPROFILE'];
+    if (home != null && home.isNotEmpty) {
+      final downloads = io.Directory('$home/Downloads');
+      if (downloads.existsSync()) {
+        return downloads;
+      }
+      return io.Directory(home);
+    }
+    return io.Directory.systemTemp;
+  }
+
   void setSeriesDeckLayout(SeriesDeckLayout layout) {
     if (_seriesDeckLayout == layout) {
       return;
     }
     _seriesDeckLayout = layout;
+    notifyListeners();
+  }
+
+  void setSeriesDeckLogY(bool enabled) {
+    if (_seriesDeckLogY == enabled) {
+      return;
+    }
+    _seriesDeckLogY = enabled;
+    if (_seriesDeck.isNotEmpty) {
+      _seriesDeckViewport = _autoSeriesDeckViewport(_seriesDeck, logY: enabled);
+      _stackedSeriesDeckViewports = {
+        for (final entry in _seriesDeck)
+          entry.stream.channel.id: _autoSeriesDeckViewportForEntry(
+            entry,
+            logY: enabled,
+          ),
+      };
+    }
     notifyListeners();
   }
 
@@ -849,10 +966,16 @@ class WorkspaceController extends ChangeNotifier {
     if (_seriesDeckLayout == SeriesDeckLayout.stacked) {
       _stackedSeriesDeckViewports = {
         for (final entry in _seriesDeck)
-          entry.stream.channel.id: _autoSeriesDeckViewportForEntry(entry),
+          entry.stream.channel.id: _autoSeriesDeckViewportForEntry(
+            entry,
+            logY: _seriesDeckLogY,
+          ),
       };
     }
-    _seriesDeckViewport = _autoSeriesDeckViewport(_seriesDeck);
+    _seriesDeckViewport = _autoSeriesDeckViewport(
+      _seriesDeck,
+      logY: _seriesDeckLogY,
+    );
     notifyListeners();
   }
 
@@ -866,17 +989,23 @@ class WorkspaceController extends ChangeNotifier {
           entry.stream.channel.id: _normalizeSeriesDeckViewportForEntry(
             entry,
             (stackedSeriesDeckViewportFor(entry.stream.channel.id) ??
-                    _autoSeriesDeckViewportForEntry(entry))
+                    _autoSeriesDeckViewportForEntry(
+                      entry,
+                      logY: _seriesDeckLogY,
+                    ))
                 .copyWith(autoX: enabled),
+            logY: _seriesDeckLogY,
           ),
       };
       notifyListeners();
       return;
     }
-    final base = _seriesDeckViewport ?? _autoSeriesDeckViewport(_seriesDeck);
+    final base = _seriesDeckViewport ??
+        _autoSeriesDeckViewport(_seriesDeck, logY: _seriesDeckLogY);
     _seriesDeckViewport = _normalizeSeriesDeckViewport(
       _seriesDeck,
       base.copyWith(autoX: enabled),
+      logY: _seriesDeckLogY,
     );
     notifyListeners();
   }
@@ -891,17 +1020,23 @@ class WorkspaceController extends ChangeNotifier {
           entry.stream.channel.id: _normalizeSeriesDeckViewportForEntry(
             entry,
             (stackedSeriesDeckViewportFor(entry.stream.channel.id) ??
-                    _autoSeriesDeckViewportForEntry(entry))
+                    _autoSeriesDeckViewportForEntry(
+                      entry,
+                      logY: _seriesDeckLogY,
+                    ))
                 .copyWith(autoY: enabled),
+            logY: _seriesDeckLogY,
           ),
       };
       notifyListeners();
       return;
     }
-    final base = _seriesDeckViewport ?? _autoSeriesDeckViewport(_seriesDeck);
+    final base = _seriesDeckViewport ??
+        _autoSeriesDeckViewport(_seriesDeck, logY: _seriesDeckLogY);
     _seriesDeckViewport = _normalizeSeriesDeckViewport(
       _seriesDeck,
       base.copyWith(autoY: enabled),
+      logY: _seriesDeckLogY,
     );
     notifyListeners();
   }
@@ -910,7 +1045,8 @@ class WorkspaceController extends ChangeNotifier {
     if (_seriesDeck.isEmpty) {
       return;
     }
-    final base = _seriesDeckViewport ?? _autoSeriesDeckViewport(_seriesDeck);
+    final base = _seriesDeckViewport ??
+        _autoSeriesDeckViewport(_seriesDeck, logY: _seriesDeckLogY);
     final span = base.xMaxNs - base.xMinNs;
     final center = (base.xMinNs + base.xMaxNs) / 2;
     final nextSpan = span * factor;
@@ -921,6 +1057,7 @@ class WorkspaceController extends ChangeNotifier {
         xMinNs: center - nextSpan / 2,
         xMaxNs: center + nextSpan / 2,
       ),
+      logY: _seriesDeckLogY,
     );
     notifyListeners();
   }
@@ -935,14 +1072,19 @@ class WorkspaceController extends ChangeNotifier {
           entry.stream.channel.id: _panSeriesDeckViewportX(
             entry,
             stackedSeriesDeckViewportFor(entry.stream.channel.id) ??
-                _autoSeriesDeckViewportForEntry(entry),
+                _autoSeriesDeckViewportForEntry(
+                  entry,
+                  logY: _seriesDeckLogY,
+                ),
             fraction,
+            logY: _seriesDeckLogY,
           ),
       };
       notifyListeners();
       return;
     }
-    final base = _seriesDeckViewport ?? _autoSeriesDeckViewport(_seriesDeck);
+    final base = _seriesDeckViewport ??
+        _autoSeriesDeckViewport(_seriesDeck, logY: _seriesDeckLogY);
     final span = base.xMaxNs - base.xMinNs;
     final delta = span * fraction;
     _seriesDeckViewport = _normalizeSeriesDeckViewport(
@@ -952,6 +1094,7 @@ class WorkspaceController extends ChangeNotifier {
         xMinNs: base.xMinNs + delta,
         xMaxNs: base.xMaxNs + delta,
       ),
+      logY: _seriesDeckLogY,
     );
     notifyListeners();
   }
@@ -960,17 +1103,29 @@ class WorkspaceController extends ChangeNotifier {
     if (_seriesDeck.isEmpty) {
       return;
     }
-    final base = _seriesDeckViewport ?? _autoSeriesDeckViewport(_seriesDeck);
-    final span = base.yMax - base.yMin;
-    final center = (base.yMin + base.yMax) / 2;
-    final nextSpan = span * factor;
+    final base = _seriesDeckViewport ??
+        _autoSeriesDeckViewport(_seriesDeck, logY: _seriesDeckLogY);
+    double newYMin;
+    double newYMax;
+    if (_seriesDeckLogY) {
+      final bounds = _logScaledYBounds(
+        base.yMin,
+        base.yMax,
+        zoomFactor: factor,
+      );
+      newYMin = bounds.$1;
+      newYMax = bounds.$2;
+    } else {
+      final span = base.yMax - base.yMin;
+      final center = (base.yMin + base.yMax) / 2;
+      final nextSpan = span * factor;
+      newYMin = center - nextSpan / 2;
+      newYMax = center + nextSpan / 2;
+    }
     _seriesDeckViewport = _normalizeSeriesDeckViewport(
       _seriesDeck,
-      base.copyWith(
-        autoY: false,
-        yMin: center - nextSpan / 2,
-        yMax: center + nextSpan / 2,
-      ),
+      base.copyWith(autoY: false, yMin: newYMin, yMax: newYMax),
+      logY: _seriesDeckLogY,
     );
     notifyListeners();
   }
@@ -985,23 +1140,39 @@ class WorkspaceController extends ChangeNotifier {
           entry.stream.channel.id: _panSeriesDeckViewportY(
             entry,
             stackedSeriesDeckViewportFor(entry.stream.channel.id) ??
-                _autoSeriesDeckViewportForEntry(entry),
+                _autoSeriesDeckViewportForEntry(
+                  entry,
+                  logY: _seriesDeckLogY,
+                ),
             fraction,
+            logY: _seriesDeckLogY,
           ),
       };
       notifyListeners();
       return;
     }
-    final base = _seriesDeckViewport ?? _autoSeriesDeckViewport(_seriesDeck);
-    final span = base.yMax - base.yMin;
-    final delta = span * fraction;
+    final base = _seriesDeckViewport ??
+        _autoSeriesDeckViewport(_seriesDeck, logY: _seriesDeckLogY);
+    double newYMin;
+    double newYMax;
+    if (_seriesDeckLogY) {
+      final bounds = _logScaledYBounds(
+        base.yMin,
+        base.yMax,
+        panFraction: fraction,
+      );
+      newYMin = bounds.$1;
+      newYMax = bounds.$2;
+    } else {
+      final span = base.yMax - base.yMin;
+      final delta = span * fraction;
+      newYMin = base.yMin + delta;
+      newYMax = base.yMax + delta;
+    }
     _seriesDeckViewport = _normalizeSeriesDeckViewport(
       _seriesDeck,
-      base.copyWith(
-        autoY: false,
-        yMin: base.yMin + delta,
-        yMax: base.yMax + delta,
-      ),
+      base.copyWith(autoY: false, yMin: newYMin, yMax: newYMax),
+      logY: _seriesDeckLogY,
     );
     notifyListeners();
   }
@@ -1016,7 +1187,8 @@ class WorkspaceController extends ChangeNotifier {
       return;
     }
 
-    final base = _seriesDeckViewport ?? _autoSeriesDeckViewport(_seriesDeck);
+    final base = _seriesDeckViewport ??
+        _autoSeriesDeckViewport(_seriesDeck, logY: _seriesDeckLogY);
     final useX = xMinNs != null || xMaxNs != null;
     final useY = yMin != null || yMax != null;
     final nextXMin = xMinNs ?? base.xMinNs;
@@ -1041,6 +1213,7 @@ class WorkspaceController extends ChangeNotifier {
         yMin: nextYMin,
         yMax: nextYMax,
       ),
+      logY: _seriesDeckLogY,
     );
     notifyListeners();
   }
@@ -1051,7 +1224,10 @@ class WorkspaceController extends ChangeNotifier {
       return;
     }
     final next = {..._stackedSeriesDeckViewports};
-    next[channelId] = _autoSeriesDeckViewportForEntry(entry);
+    next[channelId] = _autoSeriesDeckViewportForEntry(
+      entry,
+      logY: _seriesDeckLogY,
+    );
     _stackedSeriesDeckViewports = next;
     notifyListeners();
   }
@@ -1063,11 +1239,12 @@ class WorkspaceController extends ChangeNotifier {
     }
     final base =
         stackedSeriesDeckViewportFor(channelId) ??
-        _autoSeriesDeckViewportForEntry(entry);
+        _autoSeriesDeckViewportForEntry(entry, logY: _seriesDeckLogY);
     final next = {..._stackedSeriesDeckViewports};
     next[channelId] = _normalizeSeriesDeckViewportForEntry(
       entry,
       base.copyWith(autoX: enabled),
+      logY: _seriesDeckLogY,
     );
     _stackedSeriesDeckViewports = next;
     notifyListeners();
@@ -1080,11 +1257,12 @@ class WorkspaceController extends ChangeNotifier {
     }
     final base =
         stackedSeriesDeckViewportFor(channelId) ??
-        _autoSeriesDeckViewportForEntry(entry);
+        _autoSeriesDeckViewportForEntry(entry, logY: _seriesDeckLogY);
     final next = {..._stackedSeriesDeckViewports};
     next[channelId] = _normalizeSeriesDeckViewportForEntry(
       entry,
       base.copyWith(autoY: enabled),
+      logY: _seriesDeckLogY,
     );
     _stackedSeriesDeckViewports = next;
     notifyListeners();
@@ -1099,7 +1277,11 @@ class WorkspaceController extends ChangeNotifier {
       return;
     }
     final next = {..._stackedSeriesDeckViewports};
-    next[channelId] = _normalizeSeriesDeckViewportForEntry(entry, viewport);
+    next[channelId] = _normalizeSeriesDeckViewportForEntry(
+      entry,
+      viewport,
+      logY: _seriesDeckLogY,
+    );
     _stackedSeriesDeckViewports = next;
     notifyListeners();
   }
@@ -1114,12 +1296,16 @@ class WorkspaceController extends ChangeNotifier {
         entry.stream.channel.id: _normalizeSeriesDeckViewportForEntry(
           entry,
           (stackedSeriesDeckViewportFor(entry.stream.channel.id) ??
-                  _autoSeriesDeckViewportForEntry(entry))
+                  _autoSeriesDeckViewportForEntry(
+                    entry,
+                    logY: _seriesDeckLogY,
+                  ))
               .copyWith(
                 autoX: false,
                 xMinNs: sourceViewport.xMinNs,
                 xMaxNs: sourceViewport.xMaxNs,
               ),
+          logY: _seriesDeckLogY,
         ),
     };
     notifyListeners();
@@ -1135,12 +1321,16 @@ class WorkspaceController extends ChangeNotifier {
         entry.stream.channel.id: _normalizeSeriesDeckViewportForEntry(
           entry,
           (stackedSeriesDeckViewportFor(entry.stream.channel.id) ??
-                  _autoSeriesDeckViewportForEntry(entry))
+                  _autoSeriesDeckViewportForEntry(
+                    entry,
+                    logY: _seriesDeckLogY,
+                  ))
               .copyWith(
                 autoY: false,
                 yMin: sourceViewport.yMin,
                 yMax: sourceViewport.yMax,
               ),
+          logY: _seriesDeckLogY,
         ),
     };
     notifyListeners();
@@ -2499,6 +2689,8 @@ class _BackendsSection extends StatelessWidget {
         ),
         const SizedBox(height: 18),
         _NativeEnginePanel(controller: controller),
+        const SizedBox(height: 18),
+        _TomcatPanel(controller: controller),
       ],
     );
   }
@@ -3363,18 +3555,144 @@ class _CatalogStreamTile extends StatelessWidget {
   }
 }
 
-class _SeriesDeckPanel extends StatelessWidget {
-  const _SeriesDeckPanel({required this.controller});
+class _SeriesDeckPanel extends StatefulWidget {
+  const _SeriesDeckPanel({
+    required this.controller,
+    this.showDetachButton = true,
+  });
 
   final WorkspaceController controller;
+  final bool showDetachButton;
+
+  @override
+  State<_SeriesDeckPanel> createState() => _SeriesDeckPanelState();
+}
+
+class _SeriesDeckPanelState extends State<_SeriesDeckPanel> {
+  final GlobalKey _chartBoundaryKey = GlobalKey();
+
+  Future<ui.Image?> _captureChartImage(ScaffoldMessengerState messenger) async {
+    final boundary = _chartBoundaryKey.currentContext?.findRenderObject()
+        as RenderRepaintBoundary?;
+    if (boundary == null) {
+      messenger.showSnackBar(
+        const SnackBar(content: Text('Plot is not ready to capture yet.')),
+      );
+      return null;
+    }
+    return boundary.toImage(pixelRatio: 2.0);
+  }
+
+  String _exportFileStamp() {
+    return DateTime.now()
+        .toUtc()
+        .toIso8601String()
+        .replaceAll(':', '')
+        .replaceAll('-', '')
+        .split('.')
+        .first;
+  }
+
+  Future<void> _exportPng() async {
+    final messenger = ScaffoldMessenger.of(context);
+    try {
+      final image = await _captureChartImage(messenger);
+      if (image == null) return;
+      final byteData = await image.toByteData(format: ui.ImageByteFormat.png);
+      if (byteData == null) {
+        messenger.showSnackBar(
+          const SnackBar(content: Text('Failed to encode PNG.')),
+        );
+        return;
+      }
+      final dir = widget.controller._resolveExportDirectory();
+      final file = io.File('${dir.path}/datadisplay-${_exportFileStamp()}.png');
+      await file.writeAsBytes(byteData.buffer.asUint8List());
+      messenger.showSnackBar(SnackBar(content: Text('Saved ${file.path}')));
+    } catch (error) {
+      messenger.showSnackBar(SnackBar(content: Text('PNG export failed: $error')));
+    }
+  }
+
+  Future<void> _exportJpeg() async {
+    final messenger = ScaffoldMessenger.of(context);
+    try {
+      final image = await _captureChartImage(messenger);
+      if (image == null) return;
+      final rgba = await image.toByteData(format: ui.ImageByteFormat.rawRgba);
+      if (rgba == null) {
+        messenger.showSnackBar(
+          const SnackBar(content: Text('Failed to read raw pixels.')),
+        );
+        return;
+      }
+      final encoded = img.Image.fromBytes(
+        width: image.width,
+        height: image.height,
+        bytes: rgba.buffer,
+        order: img.ChannelOrder.rgba,
+      );
+      final jpegBytes = img.encodeJpg(encoded, quality: 92);
+      final dir = widget.controller._resolveExportDirectory();
+      final file = io.File('${dir.path}/datadisplay-${_exportFileStamp()}.jpg');
+      await file.writeAsBytes(jpegBytes);
+      messenger.showSnackBar(SnackBar(content: Text('Saved ${file.path}')));
+    } catch (error) {
+      messenger.showSnackBar(
+        SnackBar(content: Text('JPEG export failed: $error')),
+      );
+    }
+  }
+
+  Future<void> _exportPdf() async {
+    final messenger = ScaffoldMessenger.of(context);
+    try {
+      final image = await _captureChartImage(messenger);
+      if (image == null) return;
+      final pngData = await image.toByteData(format: ui.ImageByteFormat.png);
+      if (pngData == null) {
+        messenger.showSnackBar(
+          const SnackBar(content: Text('Failed to encode chart for PDF.')),
+        );
+        return;
+      }
+      final pdfImage = pw.MemoryImage(pngData.buffer.asUint8List());
+      final document = pw.Document();
+      document.addPage(
+        pw.Page(
+          pageFormat: pdf_core.PdfPageFormat.a4.landscape,
+          build: (context) {
+            return pw.Center(
+              child: pw.FittedBox(
+                fit: pw.BoxFit.contain,
+                child: pw.Image(pdfImage),
+              ),
+            );
+          },
+        ),
+      );
+      final bytes = await document.save();
+      final dir = widget.controller._resolveExportDirectory();
+      final file = io.File('${dir.path}/datadisplay-${_exportFileStamp()}.pdf');
+      await file.writeAsBytes(bytes);
+      messenger.showSnackBar(SnackBar(content: Text('Saved ${file.path}')));
+    } catch (error) {
+      messenger.showSnackBar(
+        SnackBar(content: Text('PDF export failed: $error')),
+      );
+    }
+  }
 
   @override
   Widget build(BuildContext context) {
+    final controller = widget.controller;
     final deck = controller.seriesDeck;
     final mixedUnits = _seriesDeckHasMixedUnits(deck);
     final viewport =
         controller.seriesDeckViewport ??
-        (deck.isEmpty ? null : _autoSeriesDeckViewport(deck));
+        (deck.isEmpty
+            ? null
+            : _autoSeriesDeckViewport(deck, logY: controller.seriesDeckLogY));
 
     return _Panel(
       title: 'Series deck',
@@ -3426,6 +3744,46 @@ class _SeriesDeckPanel extends StatelessWidget {
                       icon: const Icon(Icons.delete_sweep_rounded),
                       label: const Text('Clear deck'),
                     ),
+                    OutlinedButton.icon(
+                      onPressed: () async {
+                        final messenger = ScaffoldMessenger.of(context);
+                        final path = await controller.exportDeckAsAscii();
+                        if (path != null) {
+                          messenger.showSnackBar(
+                            SnackBar(content: Text('Exported to $path')),
+                          );
+                        }
+                      },
+                      icon: const Icon(Icons.file_download_rounded),
+                      label: const Text('Export ASCII'),
+                    ),
+                    OutlinedButton.icon(
+                      onPressed: _exportPng,
+                      icon: const Icon(Icons.image_rounded),
+                      label: const Text('Export PNG'),
+                    ),
+                    OutlinedButton.icon(
+                      onPressed: _exportJpeg,
+                      icon: const Icon(Icons.photo_camera_back_rounded),
+                      label: const Text('Export JPEG'),
+                    ),
+                    OutlinedButton.icon(
+                      onPressed: _exportPdf,
+                      icon: const Icon(Icons.picture_as_pdf_rounded),
+                      label: const Text('Export PDF'),
+                    ),
+                    if (widget.showDetachButton)
+                      OutlinedButton.icon(
+                        onPressed: () => Navigator.of(context).push(
+                          MaterialPageRoute<void>(
+                            builder: (_) => _DetachedDeckPage(
+                              controller: controller,
+                            ),
+                          ),
+                        ),
+                        icon: const Icon(Icons.open_in_new_rounded),
+                        label: const Text('Detach plot'),
+                      ),
                   ],
                 ),
                 const SizedBox(height: 12),
@@ -3465,6 +3823,11 @@ class _SeriesDeckPanel extends StatelessWidget {
                       label: const Text('Auto Y'),
                       selected: controller.seriesDeckAutoYEnabled,
                       onSelected: controller.setSeriesDeckAutoY,
+                    ),
+                    FilterChip(
+                      label: const Text('Log Y'),
+                      selected: controller.seriesDeckLogY,
+                      onSelected: controller.setSeriesDeckLogY,
                     ),
                     OutlinedButton.icon(
                       onPressed: () => controller.panSeriesDeckX(-0.2),
@@ -3508,42 +3871,81 @@ class _SeriesDeckPanel extends StatelessWidget {
                   ],
                 ),
                 const SizedBox(height: 16),
-                DecoratedBox(
-                  decoration: BoxDecoration(
-                    color: const Color(0xFFF4F7F4),
-                    borderRadius: BorderRadius.circular(22),
-                  ),
-                  child: Padding(
-                    padding: const EdgeInsets.all(16),
-                    child:
-                        controller.seriesDeckLayout == SeriesDeckLayout.overlay
-                        ? SizedBox(
-                            height: 420,
-                            child: _BrushZoomableSeriesDeckChart(
-                              viewport: viewport!,
-                              allowYZoom: true,
-                              onZoomSelection: (selection) {
-                                controller.applySeriesDeckManualBounds(
-                                  xMinNs: selection.xMinNs,
-                                  xMaxNs: selection.xMaxNs,
-                                  yMin: selection.yMin,
-                                  yMax: selection.yMax,
-                                );
-                              },
-                              child: _SeriesDeckOverlayChart(
-                                deck: deck,
-                                viewport: viewport,
+                RepaintBoundary(
+                  key: _chartBoundaryKey,
+                  child: DecoratedBox(
+                    decoration: BoxDecoration(
+                      color: const Color(0xFFF4F7F4),
+                      borderRadius: BorderRadius.circular(22),
+                    ),
+                    child: Padding(
+                      padding: const EdgeInsets.all(16),
+                      child:
+                          controller.seriesDeckLayout ==
+                              SeriesDeckLayout.overlay
+                          ? SizedBox(
+                              height: 420,
+                              child: _BrushZoomableSeriesDeckChart(
+                                viewport: viewport!,
+                                allowYZoom: true,
+                                logY: controller.seriesDeckLogY,
+                                onZoomSelection: (selection) {
+                                  controller.applySeriesDeckManualBounds(
+                                    xMinNs: selection.xMinNs,
+                                    xMaxNs: selection.xMaxNs,
+                                    yMin: selection.yMin,
+                                    yMax: selection.yMax,
+                                  );
+                                },
+                                child: _SeriesDeckOverlayChart(
+                                  deck: deck,
+                                  viewport: viewport,
+                                  logY: controller.seriesDeckLogY,
+                                ),
                               ),
+                            )
+                          : _SeriesDeckStackedCharts(
+                              controller: controller,
+                              deck: deck,
                             ),
-                          )
-                        : _SeriesDeckStackedCharts(
-                            controller: controller,
-                            deck: deck,
-                          ),
+                    ),
                   ),
                 ),
               ],
             ),
+    );
+  }
+}
+
+class _DetachedDeckPage extends StatelessWidget {
+  const _DetachedDeckPage({required this.controller});
+
+  final WorkspaceController controller;
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      backgroundColor: const Color(0xFFF3F5F2),
+      appBar: AppBar(
+        title: const Text('Detached plot deck'),
+        leading: BackButton(onPressed: () => Navigator.of(context).pop()),
+      ),
+      body: AnimatedBuilder(
+        animation: controller,
+        builder: (context, _) {
+          return SafeArea(
+            child: Padding(
+              padding: const EdgeInsets.fromLTRB(20, 18, 20, 20),
+              child: SingleChildScrollView(
+                child: _SeriesDeckPanel(
+                  controller: controller,
+                  showDetachButton: false,
+                ),
+              ),
+            ),
+          );
+        },
+      ),
     );
   }
 }
@@ -3614,12 +4016,14 @@ class _BrushZoomableSeriesDeckChart extends StatefulWidget {
     required this.allowYZoom,
     required this.onZoomSelection,
     required this.child,
+    this.logY = false,
   });
 
   final SeriesDeckViewport viewport;
   final bool allowYZoom;
   final ValueChanged<SeriesDeckViewport> onZoomSelection;
   final Widget child;
+  final bool logY;
 
   @override
   State<_BrushZoomableSeriesDeckChart> createState() =>
@@ -3743,8 +4147,7 @@ class _BrushZoomableSeriesDeckChartState
     double? nextYMin;
     double? nextYMax;
     if (widget.allowYZoom) {
-      final ySpan = widget.viewport.yMax - widget.viewport.yMin;
-      if (ySpan <= 0 || plotRect.height <= 0) {
+      if (plotRect.height <= 0) {
         return;
       }
       final topRatio = ((plotRect.bottom - selectionRect.top) / plotRect.height)
@@ -3754,8 +4157,28 @@ class _BrushZoomableSeriesDeckChartState
             0.0,
             1.0,
           );
-      nextYMin = widget.viewport.yMin + ySpan * bottomRatio;
-      nextYMax = widget.viewport.yMin + ySpan * topRatio;
+      if (widget.logY) {
+        final safeMin =
+            widget.viewport.yMin > 0 ? widget.viewport.yMin : 1e-12;
+        final safeMax = widget.viewport.yMax > safeMin
+            ? widget.viewport.yMax
+            : safeMin * 10.0;
+        final logMin = math.log(safeMin) / math.ln10;
+        final logMax = math.log(safeMax) / math.ln10;
+        final logSpan = logMax - logMin;
+        if (logSpan <= 0) {
+          return;
+        }
+        nextYMin = math.pow(10.0, logMin + logSpan * bottomRatio).toDouble();
+        nextYMax = math.pow(10.0, logMin + logSpan * topRatio).toDouble();
+      } else {
+        final ySpan = widget.viewport.yMax - widget.viewport.yMin;
+        if (ySpan <= 0) {
+          return;
+        }
+        nextYMin = widget.viewport.yMin + ySpan * bottomRatio;
+        nextYMax = widget.viewport.yMin + ySpan * topRatio;
+      }
     }
 
     widget.onZoomSelection(
@@ -3802,15 +4225,24 @@ class _SeriesDeckZoomSelectionPainter extends CustomPainter {
 }
 
 class _SeriesDeckOverlayChart extends StatelessWidget {
-  const _SeriesDeckOverlayChart({required this.deck, required this.viewport});
+  const _SeriesDeckOverlayChart({
+    required this.deck,
+    required this.viewport,
+    required this.logY,
+  });
 
   final List<SeriesDeckEntry> deck;
   final SeriesDeckViewport viewport;
+  final bool logY;
 
   @override
   Widget build(BuildContext context) {
     return CustomPaint(
-      painter: _SeriesDeckOverlayPainter(deck: deck, viewport: viewport),
+      painter: _SeriesDeckOverlayPainter(
+        deck: deck,
+        viewport: viewport,
+        logY: logY,
+      ),
       child: const SizedBox.expand(),
     );
   }
@@ -3905,6 +4337,7 @@ class _SeriesDeckStackedCharts extends StatelessWidget {
                     child: _BrushZoomableSeriesDeckChart(
                       viewport: viewport,
                       allowYZoom: true,
+                      logY: controller.seriesDeckLogY,
                       onZoomSelection: (selection) {
                         controller.applyStackedSeriesViewport(
                           deck[index].stream.channel.id,
@@ -3919,6 +4352,7 @@ class _SeriesDeckStackedCharts extends StatelessWidget {
                           xMaxNs: viewport.xMaxNs,
                           yMin: viewport.yMin,
                           yMax: viewport.yMax,
+                          logY: controller.seriesDeckLogY,
                         ),
                         child: const SizedBox.expand(),
                       ),
@@ -4562,10 +4996,15 @@ class _SeriesPainter extends CustomPainter {
 }
 
 class _SeriesDeckOverlayPainter extends CustomPainter {
-  _SeriesDeckOverlayPainter({required this.deck, required this.viewport});
+  _SeriesDeckOverlayPainter({
+    required this.deck,
+    required this.viewport,
+    required this.logY,
+  });
 
   final List<SeriesDeckEntry> deck;
   final SeriesDeckViewport viewport;
+  final bool logY;
 
   @override
   void paint(Canvas canvas, Size size) {
@@ -4579,12 +5018,15 @@ class _SeriesDeckOverlayPainter extends CustomPainter {
       ],
       xExtentOverride: (viewport.xMinNs, viewport.xMaxNs),
       yExtentOverride: (viewport.yMin, viewport.yMax),
+      logY: logY,
     );
   }
 
   @override
   bool shouldRepaint(covariant _SeriesDeckOverlayPainter oldDelegate) {
-    return oldDelegate.deck != deck || oldDelegate.viewport != viewport;
+    return oldDelegate.deck != deck ||
+        oldDelegate.viewport != viewport ||
+        oldDelegate.logY != logY;
   }
 }
 
@@ -4596,6 +5038,7 @@ class _StackedSeriesDeckPainter extends CustomPainter {
     required this.xMaxNs,
     required this.yMin,
     required this.yMax,
+    required this.logY,
   });
 
   final SeriesBlock series;
@@ -4604,6 +5047,7 @@ class _StackedSeriesDeckPainter extends CustomPainter {
   final double xMaxNs;
   final double yMin;
   final double yMax;
+  final bool logY;
 
   @override
   void paint(Canvas canvas, Size size) {
@@ -4625,6 +5069,7 @@ class _StackedSeriesDeckPainter extends CustomPainter {
       colors: [color],
       xExtentOverride: (xMinNs, xMaxNs),
       yExtentOverride: (yMin, yMax),
+      logY: logY,
     );
   }
 
@@ -4635,7 +5080,8 @@ class _StackedSeriesDeckPainter extends CustomPainter {
         oldDelegate.xMinNs != xMinNs ||
         oldDelegate.xMaxNs != xMaxNs ||
         oldDelegate.yMin != yMin ||
-        oldDelegate.yMax != yMax;
+        oldDelegate.yMax != yMax ||
+        oldDelegate.logY != logY;
   }
 }
 
@@ -4807,6 +5253,7 @@ void _paintMultiSeriesChart({
   required List<Color> colors,
   (double, double)? xExtentOverride,
   (double, double)? yExtentOverride,
+  bool logY = false,
 }) {
   final background = Paint()
     ..color = const Color(0xFFFFFFFF)
@@ -4868,24 +5315,86 @@ void _paintMultiSeriesChart({
   );
 
   final xExtent = xExtentOverride ?? _seriesDeckTimeExtent(deck);
-  final yExtent = yExtentOverride ?? _seriesDeckValueExtent(deck);
+  final yExtent = yExtentOverride ?? _seriesDeckValueExtent(deck, logY: logY);
   final xSpan = math.max(1.0, xExtent.$2 - xExtent.$1);
-  final ySpan = math.max(
-    _adaptiveMagnitudeFloor(yExtent.$1, yExtent.$2),
-    yExtent.$2 - yExtent.$1,
-  );
 
-  if (yExtent.$1 < 0 && yExtent.$2 > 0) {
-    final zeroY =
-        plotRect.bottom - ((0 - yExtent.$1) / ySpan) * plotRect.height;
-    final zeroPaint = Paint()
-      ..color = const Color(0x55445C54)
-      ..strokeWidth = 1.2;
-    canvas.drawLine(
-      Offset(plotRect.left, zeroY),
-      Offset(plotRect.right, zeroY),
-      zeroPaint,
+  // Effective y-domain bounds. For log mode we clamp non-positives to a tiny
+  // positive floor so the projection stays well-defined; data points <=0 are
+  // dropped as gaps below.
+  late final double effectiveYMin;
+  late final double effectiveYMax;
+  late final double logYMin;
+  late final double logYMax;
+  late final double logYSpan;
+  late final double linearYSpan;
+  if (logY) {
+    effectiveYMin = yExtent.$1 > 0 ? yExtent.$1 : 1e-12;
+    effectiveYMax = yExtent.$2 > effectiveYMin
+        ? yExtent.$2
+        : effectiveYMin * 10.0;
+    logYMin = math.log(effectiveYMin) / math.ln10;
+    logYMax = math.log(effectiveYMax) / math.ln10;
+    logYSpan = math.max(1e-12, logYMax - logYMin);
+    linearYSpan = effectiveYMax - effectiveYMin;
+  } else {
+    effectiveYMin = yExtent.$1;
+    effectiveYMax = yExtent.$2;
+    logYMin = 0;
+    logYMax = 0;
+    logYSpan = 1;
+    linearYSpan = math.max(
+      _adaptiveMagnitudeFloor(effectiveYMin, effectiveYMax),
+      effectiveYMax - effectiveYMin,
     );
+  }
+
+  double yToPixel(double value) {
+    if (logY) {
+      if (!value.isFinite || value <= 0) {
+        return double.nan;
+      }
+      final logValue = math.log(value) / math.ln10;
+      return plotRect.bottom -
+          ((logValue - logYMin) / logYSpan) * plotRect.height;
+    }
+    if (!value.isFinite) {
+      return double.nan;
+    }
+    return plotRect.bottom -
+        ((value - effectiveYMin) / linearYSpan) * plotRect.height;
+  }
+
+  if (!logY && effectiveYMin < 0 && effectiveYMax > 0) {
+    final zeroY = yToPixel(0);
+    if (zeroY.isFinite) {
+      final zeroPaint = Paint()
+        ..color = const Color(0x55445C54)
+        ..strokeWidth = 1.2;
+      canvas.drawLine(
+        Offset(plotRect.left, zeroY),
+        Offset(plotRect.right, zeroY),
+        zeroPaint,
+      );
+    }
+  }
+
+  if (logY) {
+    final decadeGridPaint = Paint()
+      ..color = const Color(0x33445C54)
+      ..strokeWidth = 1.0;
+    final startDecade = logYMin.floor();
+    final endDecade = logYMax.ceil();
+    for (var decade = startDecade; decade <= endDecade; decade++) {
+      final value = math.pow(10.0, decade).toDouble();
+      final yPx = yToPixel(value);
+      if (yPx.isFinite && yPx >= plotRect.top && yPx <= plotRect.bottom) {
+        canvas.drawLine(
+          Offset(plotRect.left, yPx),
+          Offset(plotRect.right, yPx),
+          decadeGridPaint,
+        );
+      }
+    }
   }
 
   canvas.save();
@@ -4909,10 +5418,15 @@ void _paintMultiSeriesChart({
       if (xNs < xExtent.$1 || xNs > xExtent.$2) {
         continue;
       }
+      final value = series.values[sampleIndex];
+      final y = yToPixel(value);
+      if (!y.isFinite) {
+        // Break the line on missing / non-positive (in log mode) samples.
+        moved = false;
+        singlePoint = null;
+        continue;
+      }
       final x = plotRect.left + ((xNs - xExtent.$1) / xSpan) * plotRect.width;
-      final y =
-          plotRect.bottom -
-          ((series.values[sampleIndex] - yExtent.$1) / ySpan) * plotRect.height;
       final point = Offset(x, y);
       if (!moved) {
         path.moveTo(x, y);
@@ -4924,7 +5438,7 @@ void _paintMultiSeriesChart({
       visiblePoints += 1;
     }
 
-    if (!moved) {
+    if (visiblePoints == 0) {
       continue;
     }
 
@@ -4948,24 +5462,35 @@ void _paintMultiSeriesChart({
     fontSize: 11,
     fontWeight: FontWeight.w600,
   );
+  final yMidValue = logY
+      ? math.pow(10.0, (logYMin + logYMax) / 2).toDouble()
+      : (effectiveYMin + effectiveYMax) / 2;
   _paintAxisText(
     canvas,
-    _formatPlotNumber(yExtent.$2),
+    _formatPlotNumber(effectiveYMax),
     axisLabelStyle,
     Offset(10, plotRect.top - 2),
   );
   _paintAxisText(
     canvas,
-    _formatPlotNumber((yExtent.$1 + yExtent.$2) / 2),
+    _formatPlotNumber(yMidValue),
     axisLabelStyle,
     Offset(10, plotRect.center.dy - 8),
   );
   _paintAxisText(
     canvas,
-    _formatPlotNumber(yExtent.$1),
+    _formatPlotNumber(effectiveYMin),
     axisLabelStyle,
     Offset(10, plotRect.bottom - 16),
   );
+  if (logY) {
+    _paintAxisText(
+      canvas,
+      'log',
+      axisLabelStyle.copyWith(fontStyle: FontStyle.italic),
+      Offset(10, plotRect.top + 14),
+    );
+  }
   _paintAxisText(
     canvas,
     _formatNsLabel(xExtent.$1.round()),
@@ -5036,20 +5561,23 @@ SeriesBlock? _asScalarSeriesBlock(DataBlock? block) {
   return null;
 }
 
-(double, double) _seriesDeckValueExtent(List<SeriesDeckEntry> deck) {
+(double, double) _seriesDeckValueExtent(
+  List<SeriesDeckEntry> deck, {
+  bool logY = false,
+}) {
   if (deck.isEmpty) {
-    return (-1, 1);
+    return logY ? (0.1, 10.0) : (-1, 1);
   }
 
   var minY = double.infinity;
   var maxY = double.negativeInfinity;
   for (final entry in deck) {
-    final extent = _seriesYExtent(entry.series);
+    final extent = _seriesYExtent(entry.series, logY: logY);
     minY = math.min(minY, extent.$1);
     maxY = math.max(maxY, extent.$2);
   }
   if (!minY.isFinite || !maxY.isFinite || maxY <= minY) {
-    return (-1, 1);
+    return logY ? (0.1, 10.0) : (-1, 1);
   }
   return (minY, maxY);
 }
@@ -5057,21 +5585,27 @@ SeriesBlock? _asScalarSeriesBlock(DataBlock? block) {
 (double, double) _seriesDeckVisibleValueExtent(
   List<SeriesDeckEntry> deck,
   double xMinNs,
-  double xMaxNs,
-) {
+  double xMaxNs, {
+  bool logY = false,
+}) {
   if (deck.isEmpty) {
-    return (-1, 1);
+    return logY ? (0.1, 10.0) : (-1, 1);
   }
 
   var minY = double.infinity;
   var maxY = double.negativeInfinity;
   for (final entry in deck) {
-    final extent = _seriesVisibleValueExtent(entry.series, xMinNs, xMaxNs);
+    final extent = _seriesVisibleValueExtent(
+      entry.series,
+      xMinNs,
+      xMaxNs,
+      logY: logY,
+    );
     minY = math.min(minY, extent.$1);
     maxY = math.max(maxY, extent.$2);
   }
   if (!minY.isFinite || !maxY.isFinite || maxY <= minY) {
-    return _seriesDeckValueExtent(deck);
+    return _seriesDeckValueExtent(deck, logY: logY);
   }
   return (minY, maxY);
 }
@@ -5128,10 +5662,11 @@ SeriesBlock? _asScalarSeriesBlock(DataBlock? block) {
 (double, double) _seriesVisibleValueExtent(
   SeriesBlock series,
   double xMinNs,
-  double xMaxNs,
-) {
+  double xMaxNs, {
+  bool logY = false,
+}) {
   if (series.values.isEmpty) {
-    return (-1, 1);
+    return logY ? (0.1, 10.0) : (-1, 1);
   }
 
   var minValue = double.infinity;
@@ -5142,14 +5677,19 @@ SeriesBlock? _asScalarSeriesBlock(DataBlock? block) {
       continue;
     }
     final value = series.values[index];
+    if (logY && (!value.isFinite || value <= 0)) {
+      continue;
+    }
     minValue = math.min(minValue, value);
     maxValue = math.max(maxValue, value);
   }
 
   if (!minValue.isFinite || !maxValue.isFinite) {
-    return _seriesYExtent(series);
+    return _seriesYExtent(series, logY: logY);
   }
-  return _expandPlotYExtent(minValue, maxValue);
+  return logY
+      ? _expandPlotLogYExtent(minValue, maxValue)
+      : _expandPlotYExtent(minValue, maxValue);
 }
 
 double _seriesTimestampNs(SeriesBlock series, int index) {
@@ -5193,9 +5733,12 @@ bool _seriesDeckHasMixedUnits(List<SeriesDeckEntry> deck) {
   return units.length > 1;
 }
 
-SeriesDeckViewport _autoSeriesDeckViewport(List<SeriesDeckEntry> deck) {
+SeriesDeckViewport _autoSeriesDeckViewport(
+  List<SeriesDeckEntry> deck, {
+  bool logY = false,
+}) {
   final xExtent = _seriesDeckTimeExtent(deck);
-  final yExtent = _seriesDeckValueExtent(deck);
+  final yExtent = _seriesDeckValueExtent(deck, logY: logY);
   return SeriesDeckViewport(
     autoX: true,
     autoY: true,
@@ -5208,8 +5751,9 @@ SeriesDeckViewport _autoSeriesDeckViewport(List<SeriesDeckEntry> deck) {
 
 SeriesDeckViewport _normalizeSeriesDeckViewport(
   List<SeriesDeckEntry> deck,
-  SeriesDeckViewport viewport,
-) {
+  SeriesDeckViewport viewport, {
+  bool logY = false,
+}) {
   final fullXExtent = _seriesDeckTimeExtent(deck);
   final fullXSpan = math.max(1.0, fullXExtent.$2 - fullXExtent.$1);
 
@@ -5243,17 +5787,31 @@ SeriesDeckViewport _normalizeSeriesDeckViewport(
     xMaxNs = fullXExtent.$2;
   }
 
-  final visibleYExtent = _seriesDeckVisibleValueExtent(deck, xMinNs, xMaxNs);
+  final visibleYExtent = _seriesDeckVisibleValueExtent(
+    deck,
+    xMinNs,
+    xMaxNs,
+    logY: logY,
+  );
   var yMin = viewport.autoY ? visibleYExtent.$1 : viewport.yMin;
   var yMax = viewport.autoY ? visibleYExtent.$2 : viewport.yMax;
-  final minYSpan = _adaptiveMagnitudeFloor(
-    visibleYExtent.$1,
-    visibleYExtent.$2,
-  );
-  if (yMax - yMin < minYSpan) {
-    final center = (yMin + yMax) / 2;
-    yMin = center - minYSpan / 2;
-    yMax = center + minYSpan / 2;
+  if (logY) {
+    if (yMin <= 0) {
+      yMin = visibleYExtent.$1 > 0 ? visibleYExtent.$1 : 1e-12;
+    }
+    if (yMax <= yMin) {
+      yMax = yMin * 10.0;
+    }
+  } else {
+    final minYSpan = _adaptiveMagnitudeFloor(
+      visibleYExtent.$1,
+      visibleYExtent.$2,
+    );
+    if (yMax - yMin < minYSpan) {
+      final center = (yMin + yMax) / 2;
+      yMin = center - minYSpan / 2;
+      yMax = center + minYSpan / 2;
+    }
   }
 
   return SeriesDeckViewport(
@@ -5266,22 +5824,27 @@ SeriesDeckViewport _normalizeSeriesDeckViewport(
   );
 }
 
-SeriesDeckViewport _autoSeriesDeckViewportForEntry(SeriesDeckEntry entry) {
-  return _autoSeriesDeckViewport([entry]);
+SeriesDeckViewport _autoSeriesDeckViewportForEntry(
+  SeriesDeckEntry entry, {
+  bool logY = false,
+}) {
+  return _autoSeriesDeckViewport([entry], logY: logY);
 }
 
 SeriesDeckViewport _normalizeSeriesDeckViewportForEntry(
   SeriesDeckEntry entry,
-  SeriesDeckViewport viewport,
-) {
-  return _normalizeSeriesDeckViewport([entry], viewport);
+  SeriesDeckViewport viewport, {
+  bool logY = false,
+}) {
+  return _normalizeSeriesDeckViewport([entry], viewport, logY: logY);
 }
 
 SeriesDeckViewport _panSeriesDeckViewportX(
   SeriesDeckEntry entry,
   SeriesDeckViewport viewport,
-  double fraction,
-) {
+  double fraction, {
+  bool logY = false,
+}) {
   final span = viewport.xMaxNs - viewport.xMinNs;
   final delta = span * fraction;
   return _normalizeSeriesDeckViewportForEntry(
@@ -5291,14 +5854,32 @@ SeriesDeckViewport _panSeriesDeckViewportX(
       xMinNs: viewport.xMinNs + delta,
       xMaxNs: viewport.xMaxNs + delta,
     ),
+    logY: logY,
   );
 }
 
 SeriesDeckViewport _panSeriesDeckViewportY(
   SeriesDeckEntry entry,
   SeriesDeckViewport viewport,
-  double fraction,
-) {
+  double fraction, {
+  bool logY = false,
+}) {
+  if (logY) {
+    final newBounds = _logScaledYBounds(
+      viewport.yMin,
+      viewport.yMax,
+      panFraction: fraction,
+    );
+    return _normalizeSeriesDeckViewportForEntry(
+      entry,
+      viewport.copyWith(
+        autoY: false,
+        yMin: newBounds.$1,
+        yMax: newBounds.$2,
+      ),
+      logY: logY,
+    );
+  }
   final span = viewport.yMax - viewport.yMin;
   final delta = span * fraction;
   return _normalizeSeriesDeckViewportForEntry(
@@ -5308,6 +5889,29 @@ SeriesDeckViewport _panSeriesDeckViewportY(
       yMin: viewport.yMin + delta,
       yMax: viewport.yMax + delta,
     ),
+    logY: logY,
+  );
+}
+
+(double, double) _logScaledYBounds(
+  double yMin,
+  double yMax, {
+  double panFraction = 0.0,
+  double zoomFactor = 1.0,
+}) {
+  final safeMin = yMin > 0 ? yMin : 1e-12;
+  final safeMax = yMax > safeMin ? yMax : safeMin * 10.0;
+  final logMin = math.log(safeMin) / math.ln10;
+  final logMax = math.log(safeMax) / math.ln10;
+  final span = logMax - logMin;
+  final delta = span * panFraction;
+  final center = (logMin + logMax) / 2 + delta;
+  final nextSpan = span * zoomFactor;
+  final newLogMin = center - nextSpan / 2;
+  final newLogMax = center + nextSpan / 2;
+  return (
+    math.pow(10.0, newLogMin).toDouble(),
+    math.pow(10.0, newLogMax).toDouble(),
   );
 }
 
@@ -5407,14 +6011,20 @@ SeriesViewport _normalizeSeriesViewport(
   );
 }
 
-(double, double) _seriesYExtent(SeriesBlock series) {
+(double, double) _seriesYExtent(SeriesBlock series, {bool logY = false}) {
   if (series.values.isEmpty) {
-    return (-1.0, 1.0);
+    return logY ? (0.1, 10.0) : (-1.0, 1.0);
   }
 
-  var minValue = series.values.first;
-  var maxValue = series.values.first;
-  for (final value in series.values.skip(1)) {
+  var minValue = double.infinity;
+  var maxValue = double.negativeInfinity;
+  for (final value in series.values) {
+    if (!value.isFinite) {
+      continue;
+    }
+    if (logY && value <= 0) {
+      continue;
+    }
     if (value < minValue) {
       minValue = value;
     }
@@ -5422,8 +6032,13 @@ SeriesViewport _normalizeSeriesViewport(
       maxValue = value;
     }
   }
+  if (!minValue.isFinite || !maxValue.isFinite) {
+    return logY ? (0.1, 10.0) : (-1.0, 1.0);
+  }
 
-  return _expandPlotYExtent(minValue, maxValue);
+  return logY
+      ? _expandPlotLogYExtent(minValue, maxValue)
+      : _expandPlotYExtent(minValue, maxValue);
 }
 
 (double, double) _expandPlotYExtent(double minValue, double maxValue) {
@@ -5437,6 +6052,21 @@ SeriesViewport _normalizeSeriesViewport(
       ? math.max(math.max(minValue.abs(), maxValue.abs()) * 0.1, floor * 100)
       : math.max(span * 0.05, floor * 100);
   return (minValue - padding, maxValue + padding);
+}
+
+(double, double) _expandPlotLogYExtent(double minValue, double maxValue) {
+  if (!minValue.isFinite || !maxValue.isFinite || minValue <= 0) {
+    return (0.1, 10.0);
+  }
+  if (maxValue <= minValue) {
+    return (minValue / 10.0, math.max(maxValue, minValue) * 10.0);
+  }
+  final logMin = math.log(minValue) / math.ln10;
+  final logMax = math.log(maxValue) / math.ln10;
+  final padding = math.max(0.05 * (logMax - logMin), 0.05);
+  final paddedMin = math.pow(10.0, logMin - padding).toDouble();
+  final paddedMax = math.pow(10.0, logMax + padding).toDouble();
+  return (paddedMin, paddedMax);
 }
 
 int _visibleSeriesSampleCount(SeriesBlock series, SeriesViewport viewport) {
@@ -5552,4 +6182,289 @@ String _formatNsLabel(int value) {
     return '${(value / 1000000).toStringAsFixed(1)} ms';
   }
   return '$value ns';
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Tomcat backend panel
+// ─────────────────────────────────────────────────────────────────────────────
+
+class _TomcatPanel extends StatefulWidget {
+  const _TomcatPanel({required this.controller});
+
+  final WorkspaceController controller;
+
+  @override
+  State<_TomcatPanel> createState() => _TomcatPanelState();
+}
+
+class _TomcatPanelState extends State<_TomcatPanel> {
+  final _hostController = TextEditingController(
+    text: 'http://olserver134.virgo.infn.it:8082/datadisplay-tomcat-backend',
+  );
+  final _liveChannelsController = TextEditingController(
+    text: 'V1:DER_DATA_H',
+  );
+
+  List<Map<String, dynamic>> _fflSources = [];
+  String? _selectedFfl;
+  bool _connecting = false;
+  String? _error;
+
+  TomcatLivePoller? _livePoller;
+  StreamSubscription<LivePollResult>? _liveSub;
+  bool _liveRunning = false;
+  LivePollResult? _lastLive;
+  int? _ffiSubscriptionId;
+  Timer? _ffiPollTimer;
+  String? _liveMode; // 'ffi' or 'http'
+  int _ffiSampleCount = 0;
+  String? _ffiLastChannel;
+
+  String get _baseUrl => _hostController.text.trim();
+
+  @override
+  void dispose() {
+    _stopLive();
+    _hostController.dispose();
+    _liveChannelsController.dispose();
+    super.dispose();
+  }
+
+  Future<void> _connect() async {
+    setState(() {
+      _connecting = true;
+      _error = null;
+      _fflSources = [];
+      _selectedFfl = null;
+    });
+    try {
+      final uri = Uri.parse('$_baseUrl/api/v1/datadisplay/ffls');
+      final response = await http.get(uri).timeout(const Duration(seconds: 8));
+      if (response.statusCode != 200) {
+        setState(() { _error = 'HTTP ${response.statusCode}'; });
+        return;
+      }
+      final json = dart_convert.jsonDecode(response.body) as List<dynamic>;
+      final sources = json.cast<Map<String, dynamic>>();
+      setState(() {
+        _fflSources = sources;
+        _selectedFfl = sources.isNotEmpty ? sources.first['id'] as String : null;
+      });
+    } catch (e) {
+      setState(() { _error = '$e'; });
+    } finally {
+      setState(() { _connecting = false; });
+    }
+  }
+
+  Future<void> _openArchiveSource() async {
+    final ffl = _selectedFfl;
+    if (ffl == null) return;
+    final urlPart = _baseUrl.replaceFirst(RegExp(r'^https?://'), '');
+    final uri = 'tomcat://$urlPart?ffl=$ffl';
+    widget.controller.openSource(uri);
+  }
+
+  Future<void> _startLive() async {
+    if (_liveRunning) return;
+    final channels = _liveChannelsController.text
+        .split(',')
+        .map((s) => s.trim())
+        .where((s) => s.isNotEmpty)
+        .toList();
+    if (channels.isEmpty) return;
+
+    final native = widget.controller.nativeLoadResult.backend;
+    final source = widget.controller.source;
+    final ffiCapable = native != null &&
+        source != null &&
+        source.uri.startsWith('tomcat://') &&
+        source.capabilities.liveSubscriptions;
+
+    if (ffiCapable) {
+      try {
+        final subId = await native.subscribe(
+          sourceId: source.sourceId,
+          channelId: channels.first,
+        );
+        _ffiSubscriptionId = subId;
+        _ffiLastChannel = channels.first;
+        _ffiSampleCount = 0;
+        _ffiPollTimer = Timer.periodic(
+          const Duration(milliseconds: 1000),
+          (_) => _pollFfiSubscription(),
+        );
+        if (mounted) {
+          setState(() {
+            _liveRunning = true;
+            _liveMode = 'ffi';
+            _error = null;
+          });
+        }
+        return;
+      } catch (error) {
+        if (mounted) setState(() { _error = 'FFI subscribe failed: $error'; });
+        return;
+      }
+    }
+
+    final poller = TomcatLivePoller(
+      baseUrl: _baseUrl,
+      channels: channels,
+      pollIntervalMs: 1000,
+    );
+    _livePoller = poller;
+    _liveSub = poller.stream.listen((result) {
+      if (mounted) setState(() { _lastLive = result; });
+    });
+    poller.start();
+    if (mounted) {
+      setState(() {
+        _liveRunning = true;
+        _liveMode = 'http';
+      });
+    }
+  }
+
+  Future<void> _pollFfiSubscription() async {
+    final native = widget.controller.nativeLoadResult.backend;
+    final subId = _ffiSubscriptionId;
+    if (native == null || subId == null) return;
+    try {
+      final block = await native.pollSubscription(subId);
+      if (block is SeriesBlock && mounted) {
+        setState(() {
+          _ffiSampleCount += block.values.length;
+        });
+      }
+    } catch (_) {
+      // swallow transient errors
+    }
+  }
+
+  Future<void> _stopLive() async {
+    _liveSub?.cancel();
+    _liveSub = null;
+    _livePoller?.dispose();
+    _livePoller = null;
+
+    _ffiPollTimer?.cancel();
+    _ffiPollTimer = null;
+    final native = widget.controller.nativeLoadResult.backend;
+    final subId = _ffiSubscriptionId;
+    if (native != null && subId != null) {
+      try {
+        await native.unsubscribe(subId);
+      } catch (_) {}
+    }
+    _ffiSubscriptionId = null;
+
+    if (mounted) {
+      setState(() {
+        _liveRunning = false;
+        _liveMode = null;
+      });
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return _Panel(
+      title: 'Tomcat backend',
+      subtitle: 'Connect to the DataDisplay Tomcat endpoint for FFL archive and live Ser data.',
+      expandChild: false,
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          TextField(
+            controller: _hostController,
+            decoration: const InputDecoration(
+              labelText: 'Backend URL',
+              hintText: 'http://olserver134.virgo.infn.it:8082/datadisplay-tomcat-backend',
+              isDense: true,
+            ),
+          ),
+          const SizedBox(height: 10),
+          Row(children: [
+            ElevatedButton(
+              onPressed: _connecting ? null : _connect,
+              child: _connecting
+                  ? const SizedBox(width: 16, height: 16, child: CircularProgressIndicator(strokeWidth: 2))
+                  : const Text('Connect'),
+            ),
+            if (_fflSources.isNotEmpty) ...[
+              const SizedBox(width: 12),
+              DropdownButton<String>(
+                value: _selectedFfl,
+                isDense: true,
+                items: [
+                  for (final src in _fflSources)
+                    DropdownMenuItem(
+                      value: src['id'] as String,
+                      child: Text(src['label'] as String? ?? src['id'] as String),
+                    ),
+                ],
+                onChanged: (v) => setState(() { _selectedFfl = v; }),
+              ),
+              const SizedBox(width: 12),
+              ElevatedButton(
+                onPressed: _selectedFfl != null ? _openArchiveSource : null,
+                child: const Text('Open archive'),
+              ),
+            ],
+          ]),
+          if (_error != null) ...[
+            const SizedBox(height: 8),
+            Text(_error!, style: const TextStyle(color: Colors.red, fontSize: 12)),
+          ],
+          const SizedBox(height: 16),
+          const Divider(),
+          const SizedBox(height: 8),
+          const Text('Live (1 Hz Ser)', style: TextStyle(fontWeight: FontWeight.w700)),
+          const SizedBox(height: 8),
+          TextField(
+            controller: _liveChannelsController,
+            decoration: const InputDecoration(
+              labelText: 'Channels (comma-separated)',
+              isDense: true,
+            ),
+          ),
+          const SizedBox(height: 10),
+          Row(children: [
+            ElevatedButton(
+              onPressed: _liveRunning ? null : _startLive,
+              child: const Text('Start live'),
+            ),
+            const SizedBox(width: 12),
+            OutlinedButton(
+              onPressed: _liveRunning ? _stopLive : null,
+              child: const Text('Stop'),
+            ),
+            if (_liveRunning) ...[
+              const SizedBox(width: 12),
+              _StatusChip(
+                label: _liveMode == 'ffi' ? 'Live (FFI)' : 'Live (HTTP)',
+                color: const Color(0xFF0A7B6C),
+              ),
+            ],
+          ]),
+          if (_liveMode == 'http' && _lastLive != null) ...[
+            const SizedBox(height: 10),
+            Text(
+              '${_lastLive!.series.length} channel(s) · '
+              '${_lastLive!.series.fold(0, (sum, s) => sum + s.values.length)} samples (HTTP)',
+              style: const TextStyle(fontSize: 12, color: Color(0xFF46534D)),
+            ),
+          ],
+          if (_liveMode == 'ffi') ...[
+            const SizedBox(height: 10),
+            Text(
+              'Channel ${_ffiLastChannel ?? '-'} · $_ffiSampleCount samples received (dd-ffi subscription)',
+              style: const TextStyle(fontSize: 12, color: Color(0xFF46534D)),
+            ),
+          ],
+        ],
+      ),
+    );
+  }
 }

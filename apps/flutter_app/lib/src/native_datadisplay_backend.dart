@@ -130,6 +130,34 @@ class NativeDatadisplayBackend implements DatadisplayBackendClient {
     );
   }
 
+  Future<int> subscribe({
+    required int sourceId,
+    required String channelId,
+    TimeRange? timeRange,
+  }) async {
+    final data = await _invoke('subscribe', {
+      'source_id': sourceId,
+      'channel_id': channelId,
+      if (timeRange != null) 'time_range': timeRange.toJson(),
+    });
+    return (data['subscription_id'] as num).toInt();
+  }
+
+  Future<DataBlock?> pollSubscription(int subscriptionId) async {
+    final data = await _invoke('poll_subscription', {
+      'subscription_id': subscriptionId,
+    });
+    final block = data['block'];
+    if (block == null) {
+      return null;
+    }
+    return DataBlock.fromJson(Map<String, dynamic>.from(block as Map));
+  }
+
+  Future<void> unsubscribe(int subscriptionId) async {
+    await _invoke('unsubscribe', {'subscription_id': subscriptionId});
+  }
+
   @override
   void dispose() {
     if (_disposed) {
@@ -277,6 +305,9 @@ class _NativeBindings {
     required this.closeSourceJson,
     required this.catalogJson,
     required this.readJson,
+    required this.subscribeJson,
+    required this.pollSubscriptionJson,
+    required this.unsubscribeJson,
   });
 
   final _EngineNewDart engineNew;
@@ -286,6 +317,9 @@ class _NativeBindings {
   final _JsonCommandDart closeSourceJson;
   final _JsonCommandDart catalogJson;
   final _JsonCommandDart readJson;
+  final _JsonCommandDart subscribeJson;
+  final _JsonCommandDart pollSubscriptionJson;
+  final _JsonCommandDart unsubscribeJson;
 
   static _NativeBindings load(DynamicLibrary library) {
     return _NativeBindings(
@@ -312,6 +346,18 @@ class _NativeBindings {
       readJson: library.lookupFunction<_JsonCommandNative, _JsonCommandDart>(
         'dd_engine_read_json',
       ),
+      subscribeJson: library
+          .lookupFunction<_JsonCommandNative, _JsonCommandDart>(
+            'dd_engine_subscribe_json',
+          ),
+      pollSubscriptionJson: library
+          .lookupFunction<_JsonCommandNative, _JsonCommandDart>(
+            'dd_engine_poll_subscription_json',
+          ),
+      unsubscribeJson: library
+          .lookupFunction<_JsonCommandNative, _JsonCommandDart>(
+            'dd_engine_unsubscribe_json',
+          ),
     );
   }
 }
@@ -371,6 +417,33 @@ void _nativeWorkerMain(Map<String, Object?> init) {
           replyPort.send(
             _invokeNativeJson(
               bindings.readJson,
+              bindings.stringFree,
+              engineHandle,
+              request,
+            ),
+          );
+        case 'subscribe':
+          replyPort.send(
+            _invokeNativeJson(
+              bindings.subscribeJson,
+              bindings.stringFree,
+              engineHandle,
+              request,
+            ),
+          );
+        case 'poll_subscription':
+          replyPort.send(
+            _invokeNativeJson(
+              bindings.pollSubscriptionJson,
+              bindings.stringFree,
+              engineHandle,
+              request,
+            ),
+          );
+        case 'unsubscribe':
+          replyPort.send(
+            _invokeNativeJson(
+              bindings.unsubscribeJson,
               bindings.stringFree,
               engineHandle,
               request,

@@ -7,7 +7,8 @@ use std::sync::{Arc, Mutex};
 
 use dd_backend::{
     Aggregation, BackendError, BackendErrorKind, CatalogQuery, DataSource, DataSourceFactory,
-    ReadQuery, ResolutionHint, SourceCapabilities, SourceRegistry, StreamDescriptor, StreamKind,
+    LiveSubscription, ReadQuery, ResolutionHint, SourceCapabilities, SourceRegistry,
+    StreamDescriptor, StreamKind, SubscribeRequest as BackendSubscribeRequest,
 };
 use dd_domain::{
     ChannelDescriptor, DataBlock, Event, EventSeries, Grid2D, Metadata, SampleAxis, SampledData,
@@ -15,6 +16,7 @@ use dd_domain::{
 };
 use dd_io_gwf::GwfFactory;
 use dd_io_hdf5::Hdf5Factory;
+use dd_io_tomcat::TomcatFflFactory;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
@@ -174,6 +176,43 @@ pub struct ReadRequest {
 pub struct ReadResponse {
     pub source_id: u64,
     pub block: FfiDataBlock,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SubscribeRequest {
+    pub source_id: u64,
+    pub channel_id: String,
+    #[serde(default)]
+    pub time_range: Option<FfiTimeRange>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SubscribeResponse {
+    pub subscription_id: u64,
+    pub source_id: u64,
+    pub channel_id: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PollSubscriptionRequest {
+    pub subscription_id: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct PollSubscriptionResponse {
+    pub subscription_id: u64,
+    pub block: Option<FfiDataBlock>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UnsubscribeRequest {
+    pub subscription_id: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UnsubscribeResponse {
+    pub subscription_id: u64,
+    pub closed: bool,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -557,6 +596,8 @@ pub struct DatadisplayEngine {
     registry: SourceRegistry,
     open_sources: BTreeMap<u64, OpenSourceHandle>,
     next_source_id: u64,
+    open_subscriptions: BTreeMap<u64, Mutex<Box<dyn LiveSubscription>>>,
+    next_subscription_id: u64,
 }
 
 struct OpenSourceHandle {
@@ -573,6 +614,8 @@ impl DatadisplayEngine {
             registry,
             open_sources: BTreeMap::new(),
             next_source_id: 1,
+            open_subscriptions: BTreeMap::new(),
+            next_subscription_id: 1,
         }
     }
 
@@ -685,6 +728,85 @@ impl DatadisplayEngine {
         })
     }
 
+    pub fn subscribe(
+        &mut self,
+        request: SubscribeRequest,
+    ) -> EngineResult<SubscribeResponse> {
+        if request.channel_id.trim().is_empty() {
+            return Err(EngineError::invalid_query(
+                "subscribe requires a channel_id",
+            ));
+        }
+
+        let source_handle = self.source_handle(request.source_id)?;
+        let live = source_handle.source.as_live().ok_or_else(|| {
+            EngineError::unsupported(format!(
+                "source `{}` does not support live subscriptions",
+                request.source_id
+            ))
+        })?;
+
+        let time_range = match request.time_range {
+            Some(range) => Some(range.into_domain()?),
+            None => None,
+        };
+
+        let backend_request = BackendSubscribeRequest {
+            channel_id: request.channel_id.clone(),
+            time_range,
+        };
+        let subscription = live
+            .subscribe(backend_request)
+            .map_err(EngineError::from)?;
+
+        let subscription_id = self.allocate_subscription_id()?;
+        self.open_subscriptions
+            .insert(subscription_id, Mutex::new(subscription));
+
+        Ok(SubscribeResponse {
+            subscription_id,
+            source_id: request.source_id,
+            channel_id: request.channel_id,
+        })
+    }
+
+    pub fn poll_subscription(
+        &self,
+        request: PollSubscriptionRequest,
+    ) -> EngineResult<PollSubscriptionResponse> {
+        let slot = self
+            .open_subscriptions
+            .get(&request.subscription_id)
+            .ok_or_else(|| {
+                EngineError::not_found(format!(
+                    "subscription `{}` is not open",
+                    request.subscription_id
+                ))
+            })?;
+        let mut guard = slot.lock().map_err(|_| {
+            EngineError::internal("subscription mutex poisoned")
+        })?;
+        let next = guard.poll_next().map_err(EngineError::from)?;
+        Ok(PollSubscriptionResponse {
+            subscription_id: request.subscription_id,
+            block: next.map(FfiDataBlock::from),
+        })
+    }
+
+    pub fn unsubscribe(
+        &mut self,
+        request: UnsubscribeRequest,
+    ) -> EngineResult<UnsubscribeResponse> {
+        let closed = self
+            .open_subscriptions
+            .remove(&request.subscription_id)
+            .is_some();
+        Ok(UnsubscribeResponse {
+            subscription_id: request.subscription_id,
+            closed,
+        })
+    }
+
     fn allocate_source_id(&mut self) -> EngineResult<u64> {
         let source_id = self.next_source_id;
         self.next_source_id = self
@@ -692,6 +814,15 @@ impl DatadisplayEngine {
             .checked_add(1)
             .ok_or_else(|| EngineError::internal("source id counter overflowed"))?;
         Ok(source_id)
+    }
+
+    fn allocate_subscription_id(&mut self) -> EngineResult<u64> {
+        let subscription_id = self.next_subscription_id;
+        self.next_subscription_id = self
+            .next_subscription_id
+            .checked_add(1)
+            .ok_or_else(|| EngineError::internal("subscription id counter overflowed"))?;
+        Ok(subscription_id)
     }
 
     fn source_handle(&self, source_id: u64) -> EngineResult<&OpenSourceHandle> {
@@ -706,11 +837,14 @@ impl Default for DatadisplayEngine {
         let mut registry = SourceRegistry::new();
         registry.register(Arc::new(Hdf5Factory::new()));
         registry.register(Arc::new(GwfFactory::new()));
+        registry.register(Arc::new(TomcatFflFactory::new()));
 
         Self {
             registry,
             open_sources: BTreeMap::new(),
             next_source_id: 1,
+            open_subscriptions: BTreeMap::new(),
+            next_subscription_id: 1,
         }
     }
 }
@@ -785,6 +919,32 @@ pub unsafe extern "C" fn dd_engine_read_json(
     request_json: *const c_char,
 ) -> *mut c_char {
     engine_json_call(handle, request_json, |engine, request| engine.read(request))
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn dd_engine_subscribe_json(
+    handle: *mut EngineHandle,
+    request_json: *const c_char,
+) -> *mut c_char {
+    engine_json_call(handle, request_json, DatadisplayEngine::subscribe)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn dd_engine_poll_subscription_json(
+    handle: *mut EngineHandle,
+    request_json: *const c_char,
+) -> *mut c_char {
+    engine_json_call(handle, request_json, |engine, request| {
+        engine.poll_subscription(request)
+    })
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn dd_engine_unsubscribe_json(
+    handle: *mut EngineHandle,
+    request_json: *const c_char,
+) -> *mut c_char {
+    engine_json_call(handle, request_json, DatadisplayEngine::unsubscribe)
 }
 
 fn engine_json_call<TRequest, TResponse>(
@@ -955,7 +1115,7 @@ with h5py.File(path, "w") as f:
         let engine = DatadisplayEngine::default();
         assert_eq!(
             engine.registered_schemes(),
-            vec!["hdf5".to_string(), "gwf".to_string()]
+            vec!["hdf5".to_string(), "gwf".to_string(), "tomcat".to_string()]
         );
     }
 

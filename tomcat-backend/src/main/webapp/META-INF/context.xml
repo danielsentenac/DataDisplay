@@ -1,0 +1,24 @@
+<Context>
+    <!-- FFL source paths on olserver134 -->
+    <Parameter name="datadisplay.ffl.sources"     value="trend,50Hz,raw"                   override="false"/>
+    <Parameter name="datadisplay.ffl.trend.path"  value="/virgoData/ffl/trend.ffl"          override="false"/>
+    <Parameter name="datadisplay.ffl.trend.label" value="Trend (1 Hz)"                     override="false"/>
+    <Parameter name="datadisplay.ffl.trend.rate"  value="1"                                 override="false"/>
+    <Parameter name="datadisplay.ffl.50Hz.path"   value="/virgoData/ffl/50Hz.ffl"           override="false"/>
+    <Parameter name="datadisplay.ffl.50Hz.label"  value="50 Hz"                             override="false"/>
+    <Parameter name="datadisplay.ffl.50Hz.rate"   value="50"                                override="false"/>
+    <Parameter name="datadisplay.ffl.raw.path"    value="/virgoData/ffl/raw.ffl"            override="false"/>
+    <Parameter name="datadisplay.ffl.raw.label"   value="Raw"                               override="false"/>
+    <Parameter name="datadisplay.ffl.raw.rate"    value="4096"                              override="false"/>
+
+    <!-- Same JNI library used by DATAVIEWER -->
+    <Parameter name="datadisplay.history.backend"   value="jni"                             override="false"/>
+    <Parameter name="datadisplay.frame.jni.path"
+               value="/virgoDev/TomcatApp/v0r1p3/4/lib/libvirgo_frame_jni.so"              override="false"/>
+
+    <!-- zFdVac online Ser feed (same endpoint as DATAVIEWER instance 3) -->
+    <Parameter name="datadisplay.zcm.endpoint"      value="tcp://olserver38.virgo.infn.it:3333" override="false"/>
+    <Parameter name="datadisplay.zcm.gps.channel"   value="GPS"                             override="false"/>
+    <Parameter name="datadisplay.live.buffer.minutes" value="5"                             override="false"/>
+    <Parameter name="datadisplay.live.poll.ms"      value="1000"                            override="false"/>
+</Context>

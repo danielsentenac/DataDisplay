@@ -64,6 +64,63 @@ flutter analyze
 flutter test
 ```
 
+## Reading Frame data
+
+The `dd-io-gwf` crate compiles a native local Frame reader (TOMCAT/Fr) when
+the C sources are reachable. The build script (`crates/dd-io-gwf/build.rs`)
+finds them in this order:
+
+1. the path in `DD_FRAMEL_ROOT`,
+2. `<repo>/../TOMCAT/Fr`, `<repo>/TOMCAT/Fr`,
+3. `<repo>/../Fr`, `<repo>/Fr`.
+
+The crate accepts `FrameL.c`, `FrIO.c`, `FrFilter.c`, and the `zlib/` files
+shipped with TOMCAT/Fr. On non-MSVC toolchains it compiles with `-std=gnu89`;
+on MSVC it defines `_CRT_SECURE_NO_WARNINGS` and `_CRT_NONSTDC_NO_DEPRECATE`
+to accept the POSIX-flavoured names FrameL relies on.
+
+### Windows
+
+1. Install Visual Studio with C++ support (MSVC) and the standard Rust target
+   `x86_64-pc-windows-msvc`.
+2. Place `TOMCAT/Fr` next to the repository (or set `DD_FRAMEL_ROOT`).
+3. `flutter build windows` — the project's CMake hook
+   (`apps/flutter_app/cmake/build_and_copy_dd_ffi.cmake`) invokes
+   `cargo build -p dd-ffi`, which transitively builds Frame support.
+4. The resulting `dd_ffi.dll` is copied next to the Flutter `runner.exe`.
+
+If Frame is not found, `gwf://` sources still expose catalog metadata but
+the native read path is disabled.
+
+### Windows installer (`DataDisplayWindows_setup.exe`)
+
+The installer is produced on a `windows-latest` GitHub Actions runner via
+`.github/workflows/windows-release.yml`. Frame support is mandatory in this
+build, so the workflow expects a second repository that ships the
+`TOMCAT/Fr` C sources.
+
+One-time setup on GitHub:
+
+1. Push this repository to GitHub.
+2. In *Settings → Secrets and variables → Actions*:
+   - Set **variable** `TOMCAT_FR_REPO` to the `owner/name` of the repo
+     that holds `FrameL.c`, `FrameL.h`, `FrIO.c`, `FrFilter.c`, and the
+     `zlib/` directory at its root.
+   - If that repo is private, set **secret** `TOMCAT_FR_TOKEN` to a PAT
+     (or GitHub App token) with read access.
+
+To produce an installer:
+
+- Tag a release: `git tag v0.1.0 && git push origin v0.1.0`. The workflow
+  attaches `DataDisplayWindows_setup.exe` to the resulting release.
+- Or run *Actions → Windows installer → Run workflow* manually. The
+  installer is available as the `DataDisplayWindows_setup` artifact.
+
+The installer script lives at `windows/installer/datadisplay.iss` and
+produces `dist/DataDisplayWindows_setup.exe`. It bundles the Flutter
+runner, `dd_ffi.dll`, Frame-enabled GWF, HDF5, and Tomcat adapters, and
+creates Start Menu (and optionally desktop) shortcuts.
+
 ## Next Steps
 
 1. add richer HDF5 conventions for timestamps, irregular axes, and domain-specific metadata

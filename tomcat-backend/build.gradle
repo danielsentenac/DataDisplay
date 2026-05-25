@@ -1,0 +1,39 @@
+apply plugin: 'war'
+
+sourceCompatibility = 1.8
+targetCompatibility = 1.8
+
+war {
+    archiveBaseName = 'datadisplay-tomcat-backend'
+}
+
+tasks.withType(JavaCompile) {
+    options.encoding = 'UTF-8'
+}
+
+// ---------------------------------------------------------------------------
+// Dependency resolution strategy
+//
+// On a developer workstation with internet access:
+//   gradle war                    (uses mavenCentral below)
+//
+// On olserver134 (no Gradle / no internet needed):
+//   See build-war.sh in this directory — builds with plain javac + jar using
+//   the servlet-api.jar bundled with the deployed Tomcat installation.
+// ---------------------------------------------------------------------------
+
+// Resolve servlet-api from the deployed Tomcat if available, otherwise fall
+// back to Maven Central (used on dev workstations).
+def localServletApi = file('/virgoApp/Tomcat/v0r1p3/apache-tomcat-9.0.0.M4/lib/servlet-api.jar')
+
+repositories {
+    mavenCentral()
+}
+
+dependencies {
+    if (localServletApi.exists()) {
+        compileOnly files(localServletApi)
+    } else {
+        compileOnly 'javax.servlet:javax.servlet-api:3.1.0'
+    }
+}

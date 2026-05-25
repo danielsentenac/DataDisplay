@@ -27,6 +27,8 @@ fn detect_framel_root() -> Option<PathBuf> {
     let candidates = [
         manifest_dir.join("../../../TOMCAT/Fr"),
         manifest_dir.join("../../TOMCAT/Fr"),
+        manifest_dir.join("../../../Fr"),
+        manifest_dir.join("../../Fr"),
     ];
 
     for candidate in candidates {
@@ -77,16 +79,17 @@ fn register_rerun_paths(root: &Path) {
 fn compile_framel(root: &Path) {
     let frame_root = format!("\"{}\"", root.display());
     let frame_version = "\"0.0\"";
+    let target_os = env::var("CARGO_CFG_TARGET_OS").ok();
+    let target_env = env::var("CARGO_CFG_TARGET_ENV").ok();
+    let is_windows = target_os.as_deref() == Some("windows");
+    let is_msvc = target_env.as_deref() == Some("msvc");
+
     let mut build = cc::Build::new();
     build
         .include(root)
         .include(root.join("zlib"))
-        .define("_GNU_SOURCE", None)
         .define("FR_VERSION", Some(frame_version))
         .define("FR_PATH", Some(frame_root.as_str()))
-        .flag_if_supported("-std=gnu89")
-        .flag_if_supported("-Wno-incompatible-pointer-types")
-        .flag_if_supported("-Wno-int-conversion")
         .warnings(false)
         .file(root.join("FrFilter.c"))
         .file(root.join("FrIO.c"))
@@ -105,9 +108,26 @@ fn compile_framel(root: &Path) {
         .file(root.join("zlib/Fruncompr.c"))
         .file(root.join("zlib/Frzutil.c"));
 
+    if is_msvc {
+        // MSVC: silence "deprecated" CRT warnings and accept the legacy GNU-C
+        // shape of FrameL. Without these the C runtime emits errors for POSIX
+        // names that Frame uses (read, open, ...).
+        build
+            .define("_CRT_SECURE_NO_WARNINGS", None)
+            .define("_CRT_NONSTDC_NO_DEPRECATE", None)
+            .flag_if_supported("/W0");
+    } else {
+        // GCC / Clang: keep the legacy dialect Frame was originally tuned for.
+        build
+            .define("_GNU_SOURCE", None)
+            .flag_if_supported("-std=gnu89")
+            .flag_if_supported("-Wno-incompatible-pointer-types")
+            .flag_if_supported("-Wno-int-conversion");
+    }
+
     build.compile("ddframel");
 
-    if env::var("CARGO_CFG_TARGET_OS").ok().as_deref() != Some("windows") {
+    if !is_windows {
         println!("cargo:rustc-link-lib=m");
     }
 }

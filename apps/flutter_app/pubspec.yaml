@@ -33,6 +33,9 @@ dependencies:
 
   cupertino_icons: ^1.0.8
   ffi: ^2.1.4
+  http: ^1.2.0
+  image: ^4.0.0
+  pdf: ^3.10.0
 
 dev_dependencies:
   flutter_test:

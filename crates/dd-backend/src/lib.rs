@@ -227,6 +227,12 @@ pub trait DataSource: Send + Sync {
     fn read_many(&self, queries: &[ReadQuery]) -> BackendResult<Vec<DataBlock>> {
         queries.iter().map(|query| self.read(query)).collect()
     }
+
+    /// Returns a reference to the source's live API if it supports
+    /// subscriptions. Defaults to `None` for offline-only adapters.
+    fn as_live(&self) -> Option<&dyn LiveDataSource> {
+        None
+    }
 }
 
 pub trait LiveSubscription: Send {

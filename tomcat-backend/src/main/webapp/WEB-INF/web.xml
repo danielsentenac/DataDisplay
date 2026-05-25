@@ -1,0 +1,89 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<web-app xmlns="http://xmlns.jcp.org/xml/ns/javaee"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://xmlns.jcp.org/xml/ns/javaee http://xmlns.jcp.org/xml/ns/javaee/web-app_3_1.xsd"
+         version="3.1">
+    <display-name>DataDisplay Tomcat Backend</display-name>
+
+    <!-- FFL source registry: comma-separated list of source IDs.
+         For each id "X": datadisplay.ffl.X.path and datadisplay.ffl.X.rate must be set. -->
+    <context-param>
+        <param-name>datadisplay.ffl.sources</param-name>
+        <param-value>trend,50Hz,raw</param-value>
+    </context-param>
+
+    <context-param>
+        <param-name>datadisplay.ffl.trend.path</param-name>
+        <param-value>/virgoData/ffl/trend.ffl</param-value>
+    </context-param>
+    <context-param>
+        <param-name>datadisplay.ffl.trend.label</param-name>
+        <param-value>Trend (1 Hz)</param-value>
+    </context-param>
+    <context-param>
+        <param-name>datadisplay.ffl.trend.rate</param-name>
+        <param-value>1</param-value>
+    </context-param>
+
+    <context-param>
+        <param-name>datadisplay.ffl.50Hz.path</param-name>
+        <param-value>/virgoData/ffl/50Hz.ffl</param-value>
+    </context-param>
+    <context-param>
+        <param-name>datadisplay.ffl.50Hz.label</param-name>
+        <param-value>50 Hz</param-value>
+    </context-param>
+    <context-param>
+        <param-name>datadisplay.ffl.50Hz.rate</param-name>
+        <param-value>50</param-value>
+    </context-param>
+
+    <context-param>
+        <param-name>datadisplay.ffl.raw.path</param-name>
+        <param-value>/virgoData/ffl/raw.ffl</param-value>
+    </context-param>
+    <context-param>
+        <param-name>datadisplay.ffl.raw.label</param-name>
+        <param-value>Raw</param-value>
+    </context-param>
+    <context-param>
+        <param-name>datadisplay.ffl.raw.rate</param-name>
+        <param-value>4096</param-value>
+    </context-param>
+
+    <!-- Archive reader backend: "jni" (default) or "swig" -->
+    <context-param>
+        <param-name>datadisplay.history.backend</param-name>
+        <param-value>jni</param-value>
+    </context-param>
+    <context-param>
+        <param-name>datadisplay.frame.jni.library</param-name>
+        <param-value>virgo_frame_jni</param-value>
+    </context-param>
+    <context-param>
+        <param-name>datadisplay.frame.jni.path</param-name>
+        <param-value></param-value>
+    </context-param>
+
+    <!-- ZCM live subscription endpoint for online Ser data (zFdVac) -->
+    <context-param>
+        <param-name>datadisplay.zcm.endpoint</param-name>
+        <param-value></param-value>
+    </context-param>
+    <context-param>
+        <param-name>datadisplay.zcm.gps.channel</param-name>
+        <param-value>GPS</param-value>
+    </context-param>
+    <context-param>
+        <param-name>datadisplay.live.buffer.minutes</param-name>
+        <param-value>5</param-value>
+    </context-param>
+    <context-param>
+        <param-name>datadisplay.live.poll.ms</param-name>
+        <param-value>1000</param-value>
+    </context-param>
+
+    <listener>
+        <listener-class>org.virgo.datadisplay.servlet.DdBackendBootstrap</listener-class>
+    </listener>
+</web-app>

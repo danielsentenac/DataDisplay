@@ -6,6 +6,7 @@ members = [
   "crates/dd-render",
   "crates/dd-io-hdf5",
   "crates/dd-io-gwf",
+  "crates/dd-io-tomcat",
   "crates/dd-ffi",
 ]
 resolver = "2"

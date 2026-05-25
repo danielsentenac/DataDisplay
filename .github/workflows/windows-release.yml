@@ -1,0 +1,164 @@
+name: Windows installer
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tomcat_fr_ref:
+        description: 'Git ref for the TOMCAT/Fr checkout (branch / tag / SHA).'
+        required: false
+        default: 'main'
+
+# Required configuration before this workflow can succeed:
+#   - Repository variable TOMCAT_FR_REPO (owner/name of a repo that contains
+#     FrameL.c, FrameL.h, FrIO.c, FrFilter.c, and the zlib/ directory at its
+#     root — same layout the dd-io-gwf build script expects under TOMCAT/Fr).
+#   - If that repo is private, also set repository secret TOMCAT_FR_TOKEN to
+#     a PAT (or GitHub App token) that can read it.
+#
+# The Frame-support requirement is hard: the workflow fails fast if
+# TOMCAT_FR_REPO is missing or the checkout does not contain FrameL.c.
+
+jobs:
+  build-installer:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    permissions:
+      contents: write
+    env:
+      FLUTTER_VERSION: '3.27.0'
+      RUST_TOOLCHAIN: '1.83.0'
+      TOMCAT_FR_REPO: ${{ vars.TOMCAT_FR_REPO }}
+      TOMCAT_FR_TOKEN: ${{ secrets.TOMCAT_FR_TOKEN }}
+
+    steps:
+      - name: Validate TOMCAT_FR_REPO is set
+        shell: pwsh
+        run: |
+          if (-not $env:TOMCAT_FR_REPO) {
+            Write-Error "Repository variable TOMCAT_FR_REPO is not set. Frame support is required for the Windows installer; set TOMCAT_FR_REPO (e.g. 'my-org/TOMCAT-Fr') and TOMCAT_FR_TOKEN if it is private."
+            exit 1
+          }
+
+      - name: Checkout DataDisplay
+        uses: actions/checkout@v4
+        with:
+          path: DATADISPLAY
+
+      - name: Checkout TOMCAT/Fr sources
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.TOMCAT_FR_REPO }}
+          token: ${{ env.TOMCAT_FR_TOKEN || github.token }}
+          ref: ${{ github.event.inputs.tomcat_fr_ref || 'main' }}
+          path: TOMCAT/Fr
+
+      - name: Verify Frame sources are present
+        shell: pwsh
+        run: |
+          $root = "${{ github.workspace }}\TOMCAT\Fr"
+          $required = @(
+            "FrameL.c", "FrameL.h", "FrIO.c", "FrFilter.c",
+            "zlib\Frcompress.c"
+          )
+          foreach ($f in $required) {
+            if (-not (Test-Path "$root\$f")) {
+              Write-Error "Required Frame source $f not found in $root. Check TOMCAT_FR_REPO layout."
+              exit 1
+            }
+          }
+          Write-Host "Frame sources verified at $root"
+          "DD_FRAMEL_ROOT=$root" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Setup Rust (MSVC)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          targets: x86_64-pc-windows-msvc
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            DATADISPLAY/target
+          key: cargo-${{ runner.os }}-${{ hashFiles('DATADISPLAY/Cargo.lock') }}
+          restore-keys: |
+            cargo-${{ runner.os }}-
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+
+      - name: Show toolchain versions
+        shell: pwsh
+        run: |
+          flutter --version
+          rustc --version
+          cargo --version
+
+      - name: flutter pub get
+        shell: pwsh
+        working-directory: DATADISPLAY/apps/flutter_app
+        run: flutter pub get
+
+      - name: Build Rust dd-ffi (release) with Frame support
+        shell: pwsh
+        working-directory: DATADISPLAY
+        env:
+          DD_FRAMEL_ROOT: ${{ env.DD_FRAMEL_ROOT }}
+        run: cargo build -p dd-ffi --release
+
+      - name: Build Flutter Windows release
+        shell: pwsh
+        working-directory: DATADISPLAY/apps/flutter_app
+        env:
+          DD_FRAMEL_ROOT: ${{ env.DD_FRAMEL_ROOT }}
+        run: flutter build windows --release
+
+      - name: Confirm dd_ffi.dll is staged with the runner
+        shell: pwsh
+        working-directory: DATADISPLAY/apps/flutter_app/build/windows/x64/runner/Release
+        run: |
+          if (-not (Test-Path "dd_ffi.dll")) {
+            Write-Error "dd_ffi.dll is not present next to datadisplay_app.exe. The CMake hook should have staged it."
+            exit 1
+          }
+          Get-ChildItem | Sort-Object Name | Format-Table Mode,Length,Name
+
+      - name: Install Inno Setup
+        shell: pwsh
+        run: |
+          choco install innosetup --no-progress -y
+
+      - name: Build DataDisplayWindows_setup.exe
+        shell: pwsh
+        working-directory: DATADISPLAY/windows/installer
+        run: |
+          $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) {
+            $iscc = "C:\Program Files\Inno Setup 6\ISCC.exe"
+          }
+          & $iscc /Qp datadisplay.iss
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Get-ChildItem -Recurse ..\..\dist | Format-Table Mode,Length,Name
+
+      - name: Upload installer artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: DataDisplayWindows_setup
+          path: DATADISPLAY/dist/DataDisplayWindows_setup.exe
+          if-no-files-found: error
+
+      - name: Attach installer to release (tag push only)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: DATADISPLAY/dist/DataDisplayWindows_setup.exe
+          fail_on_unmatched_files: true
