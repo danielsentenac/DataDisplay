@@ -28,7 +28,7 @@ jobs:
     permissions:
       contents: write
     env:
-      FLUTTER_VERSION: '3.27.0'
+      FLUTTER_VERSION: '3.44.0'
       RUST_TOOLCHAIN: '1.83.0'
       TOMCAT_FR_REPO: ${{ vars.TOMCAT_FR_REPO }}
       TOMCAT_FR_TOKEN: ${{ secrets.TOMCAT_FR_TOKEN }}
