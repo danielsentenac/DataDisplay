@@ -6224,7 +6224,20 @@ class _TomcatPanelState extends State<_TomcatPanel> {
 
   @override
   void dispose() {
-    _stopLive();
+    // Tear down live resources directly here without setState — the widget is
+    // already being unmounted, so notifying listeners is unsafe.
+    _liveSub?.cancel();
+    _liveSub = null;
+    _livePoller?.dispose();
+    _livePoller = null;
+    _ffiPollTimer?.cancel();
+    _ffiPollTimer = null;
+    final native = widget.controller.nativeLoadResult.backend;
+    final subId = _ffiSubscriptionId;
+    if (native != null && subId != null) {
+      native.unsubscribe(subId).catchError((_) {});
+    }
+    _ffiSubscriptionId = null;
     _hostController.dispose();
     _liveChannelsController.dispose();
     super.dispose();
