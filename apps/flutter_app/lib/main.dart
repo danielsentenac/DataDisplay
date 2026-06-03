@@ -4,6 +4,7 @@ import 'dart:io' as io;
 import 'dart:math' as math;
 import 'dart:ui' as ui;
 
+import 'package:file_selector/file_selector.dart' as fs;
 import 'package:flutter/material.dart';
 import 'package:flutter/rendering.dart';
 import 'package:flutter/services.dart';
@@ -2976,6 +2977,7 @@ class _SourceLauncherPanel extends StatelessWidget {
         children: [
           TextField(
             controller: sourceUriController,
+            enabled: !controller.isBusy,
             decoration: InputDecoration(
               labelText: 'Source URI',
               hintText:
@@ -2998,6 +3000,13 @@ class _SourceLauncherPanel extends StatelessWidget {
                 onPressed: controller.isBusy ? null : onOpenSource,
                 icon: const Icon(Icons.link_rounded),
                 label: const Text('Open source'),
+              ),
+              OutlinedButton.icon(
+                onPressed: controller.isBusy
+                    ? null
+                    : () => _pickSourceFile(context, sourceUriController),
+                icon: const Icon(Icons.folder_open_rounded),
+                label: const Text('Browse...'),
               ),
             ],
           ),
@@ -4380,11 +4389,11 @@ class _NativeEnginePanel extends StatelessWidget {
       title: 'Native engine',
       subtitle:
           'The Flutter app loads the Rust cdylib at runtime for local source access.',
-      child: SingleChildScrollView(
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            _StatusChip(
+      expandChild: false,
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          _StatusChip(
               label: controller.runtimeLabel,
               color: controller.nativeAvailable
                   ? const Color(0xFF0A7B6C)
@@ -4424,7 +4433,6 @@ class _NativeEnginePanel extends StatelessWidget {
               ),
           ],
         ),
-      ),
     );
   }
 }
@@ -6142,6 +6150,35 @@ double _adaptiveMagnitudeFloor(double minValue, double maxValue) {
     return 1e-24;
   }
   return referenceMagnitude * 1e-6;
+}
+
+/// Opens a native file picker constrained to GWF / FFL extensions, then
+/// writes the resulting URI into the source-launcher text field using the
+/// matching scheme. Does not auto-trigger the Open action so the user can
+/// review the series query before committing.
+Future<void> _pickSourceFile(
+  BuildContext context,
+  TextEditingController target,
+) async {
+  const typeGroup = fs.XTypeGroup(
+    label: 'Frame data',
+    extensions: ['gwf', 'ffl'],
+  );
+  try {
+    final file = await fs.openFile(acceptedTypeGroups: [typeGroup]);
+    if (file == null) {
+      return;
+    }
+    final scheme = file.path.toLowerCase().endsWith('.ffl') ? 'ffl' : 'gwf';
+    final uri = '$scheme://${file.path}?series=raw';
+    target.text = uri;
+    target.selection = TextSelection.collapsed(offset: uri.length);
+  } catch (error) {
+    if (!context.mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(content: Text('File picker failed: $error')),
+    );
+  }
 }
 
 Color _kindColor(StreamKind kind) {
