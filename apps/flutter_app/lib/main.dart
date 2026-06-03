@@ -2978,7 +2978,8 @@ class _SourceLauncherPanel extends StatelessWidget {
             controller: sourceUriController,
             decoration: InputDecoration(
               labelText: 'Source URI',
-              hintText: 'gwf:///data/run01.gwf?series=raw',
+              hintText:
+                  'gwf:///data/run01.gwf?series=raw  or  ffl:///data/list.ffl?series=raw',
               filled: true,
               fillColor: const Color(0xFFF2F5F1),
               border: OutlineInputBorder(

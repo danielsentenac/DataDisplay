@@ -434,6 +434,43 @@ impl GwfFactory {
     }
 }
 
+/// Re-export of `GwfFactory` bound to the `ffl://` scheme. Frame's
+/// `FrFileINew` already accepts `.ffl` (Frame File List) paths transparently,
+/// so this is purely a discoverability shim: users typing
+/// `ffl:///path/to/list.ffl` route through the same Frame reader and series
+/// parser as `gwf://`.
+#[derive(Default, Clone, Debug)]
+pub struct FflFactory {
+    inner: GwfFactory,
+}
+
+impl FflFactory {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn with_frame_reader(mut self, frame_reader: Arc<dyn FrameReader>) -> Self {
+        self.inner = self.inner.with_frame_reader(frame_reader);
+        self
+    }
+}
+
+impl DataSourceFactory for FflFactory {
+    fn scheme(&self) -> &str {
+        "ffl"
+    }
+
+    fn open(&self, target: &SourceTarget) -> BackendResult<Box<dyn DataSource>> {
+        // Translate `ffl://` to `gwf://` for the shared parser, then delegate.
+        let rewritten = target
+            .uri
+            .strip_prefix("ffl://")
+            .map(|tail| format!("gwf://{tail}"))
+            .unwrap_or_else(|| target.uri.clone());
+        self.inner.open(&SourceTarget::new(rewritten))
+    }
+}
+
 impl DataSourceFactory for GwfFactory {
     fn scheme(&self) -> &str {
         "gwf"

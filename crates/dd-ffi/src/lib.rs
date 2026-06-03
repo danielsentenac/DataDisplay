@@ -14,7 +14,7 @@ use dd_domain::{
     ChannelDescriptor, DataBlock, Event, EventSeries, Grid2D, Metadata, SampleAxis, SampledData,
     Series1D, TimeAxis, TimeRange, Volume3D,
 };
-use dd_io_gwf::GwfFactory;
+use dd_io_gwf::{FflFactory, GwfFactory};
 use dd_io_hdf5::Hdf5Factory;
 use dd_io_tomcat::TomcatFflFactory;
 use serde::de::DeserializeOwned;
@@ -837,6 +837,7 @@ impl Default for DatadisplayEngine {
         let mut registry = SourceRegistry::new();
         registry.register(Arc::new(Hdf5Factory::new()));
         registry.register(Arc::new(GwfFactory::new()));
+        registry.register(Arc::new(FflFactory::new()));
         registry.register(Arc::new(TomcatFflFactory::new()));
 
         Self {
@@ -1115,7 +1116,12 @@ with h5py.File(path, "w") as f:
         let engine = DatadisplayEngine::default();
         assert_eq!(
             engine.registered_schemes(),
-            vec!["hdf5".to_string(), "gwf".to_string(), "tomcat".to_string()]
+            vec![
+                "hdf5".to_string(),
+                "gwf".to_string(),
+                "ffl".to_string(),
+                "tomcat".to_string(),
+            ]
         );
     }
 
