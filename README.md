@@ -64,6 +64,24 @@ flutter analyze
 flutter test
 ```
 
+## Runtime environment variables
+
+| Variable | Effect | Scope |
+|----------|--------|-------|
+| `DD_FRAMEL_ROOT` | Path to the TOMCAT/Fr C sources used by `dd-io-gwf/build.rs` to compile native Frame support into `dd_ffi`. Without it `gwf://` reads fail with a "native Frame reader required" banner. | build-time |
+| `DD_FFI_LIBRARY_PATH` | Absolute path to a `libdd_ffi.so` / `dd_ffi.dll` / `libdd_ffi.dylib`. Skips the candidate-path search. | runtime, Flutter shell |
+| `DD_TOMCAT_URL` | Pre-fills the Backends → Tomcat panel host field. Default: `http://olserver134.virgo.infn.it:8082/datadisplay-tomcat-backend`. | runtime, Flutter shell |
+| `DD_TOMCAT_LIVE_CHANNELS` | Comma-separated default channel list for Tomcat live polling. Default: `V1:DER_DATA_H`. | runtime, Flutter shell |
+
+For a typical desktop launch with Frame and a custom Tomcat backend:
+
+```bash
+export DD_FRAMEL_ROOT=/path/to/TOMCAT/Fr        # only needed before the first build
+export DD_TOMCAT_URL=http://my-host:8082/datadisplay-tomcat-backend
+cd apps/flutter_app
+flutter run -d linux
+```
+
 ## Reading Frame data
 
 The `dd-io-gwf` crate compiles a native local Frame reader (TOMCAT/Fr) when

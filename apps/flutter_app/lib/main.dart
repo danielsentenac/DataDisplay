@@ -6197,12 +6197,28 @@ class _TomcatPanel extends StatefulWidget {
   State<_TomcatPanel> createState() => _TomcatPanelState();
 }
 
+/// Default Tomcat backend URL. Overridable at startup with `DD_TOMCAT_URL`.
+String _defaultTomcatUrl() {
+  final fromEnv = io.Platform.environment['DD_TOMCAT_URL']?.trim();
+  if (fromEnv != null && fromEnv.isNotEmpty) {
+    return fromEnv;
+  }
+  return 'http://olserver134.virgo.infn.it:8082/datadisplay-tomcat-backend';
+}
+
+/// Default channel list for the live panel. Overridable with `DD_TOMCAT_LIVE_CHANNELS`.
+String _defaultTomcatLiveChannels() {
+  final fromEnv = io.Platform.environment['DD_TOMCAT_LIVE_CHANNELS']?.trim();
+  if (fromEnv != null && fromEnv.isNotEmpty) {
+    return fromEnv;
+  }
+  return 'V1:DER_DATA_H';
+}
+
 class _TomcatPanelState extends State<_TomcatPanel> {
-  final _hostController = TextEditingController(
-    text: 'http://olserver134.virgo.infn.it:8082/datadisplay-tomcat-backend',
-  );
+  final _hostController = TextEditingController(text: _defaultTomcatUrl());
   final _liveChannelsController = TextEditingController(
-    text: 'V1:DER_DATA_H',
+    text: _defaultTomcatLiveChannels(),
   );
 
   List<Map<String, dynamic>> _fflSources = [];
