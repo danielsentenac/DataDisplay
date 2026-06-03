@@ -112,9 +112,13 @@ fn compile_framel(root: &Path) {
         // MSVC: silence "deprecated" CRT warnings and accept the legacy GNU-C
         // shape of FrameL. Without these the C runtime emits errors for POSIX
         // names that Frame uses (read, open, ...).
+        // popen/pclose live under _popen/_pclose on MSVC; remap so the
+        // FrFileIOpenOSDF code path links cleanly.
         build
             .define("_CRT_SECURE_NO_WARNINGS", None)
             .define("_CRT_NONSTDC_NO_DEPRECATE", None)
+            .define("popen", Some("_popen"))
+            .define("pclose", Some("_pclose"))
             .flag_if_supported("/W0");
     } else {
         // GCC / Clang: keep the legacy dialect Frame was originally tuned for.
