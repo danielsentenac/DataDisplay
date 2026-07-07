@@ -358,9 +358,19 @@ impl FrameFileHandle {
         })?;
         let raw = unsafe { FrFileINew(file_path_c.as_ptr()) };
         if raw.is_null() {
-            return Err(BackendError::io(format!(
-                "failed to open local GWF source `{file_path}` through the Frame library"
-            )));
+            let is_ffl = file_path
+                .rsplit('.')
+                .next()
+                .map(|ext| ext.eq_ignore_ascii_case("ffl"))
+                .unwrap_or(false);
+            let detail = if is_ffl {
+                "failed to open Frame File List `{p}` through the Frame library; \
+                 check that the .gwf paths listed inside the FFL are reachable on \
+                 this host (FrameL passes them straight to fopen)"
+            } else {
+                "failed to open Frame source `{p}` through the Frame library"
+            };
+            return Err(BackendError::io(detail.replace("{p}", file_path)));
         }
         Ok(Self { raw })
     }

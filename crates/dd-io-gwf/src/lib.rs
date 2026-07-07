@@ -359,12 +359,12 @@ impl FrameReader for UnavailableFrameReader {
 fn unavailable_frame_reader_message(file_path: &str, series_class: GwfSeriesClass) -> String {
     if cfg!(target_os = "windows") {
         format!(
-            "local GWF access for `{file_path}` with series `{}` is not implemented on Windows yet",
+            "local Frame access for `{file_path}` with series `{}` is not implemented on Windows yet",
             series_class.as_str()
         )
     } else {
         format!(
-            "local GWF access for `{file_path}` with series `{}` requires a native Frame reader; set DD_FRAMEL_ROOT or place TOMCAT/Fr next to DATADISPLAY",
+            "local Frame access for `{file_path}` with series `{}` requires a native Frame reader; set DD_FRAMEL_ROOT or place TOMCAT/Fr next to DATADISPLAY",
             series_class.as_str()
         )
     }
