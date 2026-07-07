@@ -38,6 +38,8 @@ Current implementation notes:
 - the `HDF5` crate now opens real `.h5` files through a pure-Rust reader and maps discovered datasets into neutral stream descriptors
 - the adapter still supports registered in-memory layouts for focused tests and future custom mappings
 - the `GWF` crate now has a real `FrameReader` boundary plus first-pass native local Frame support for `adc`, `proc`, and `sim`; `ser` streams are cataloged but still metadata-only
+- `dd-processing` is a real DSP core: Welch PSD/ASD (mean/median/decay averaging), coherence, transfer functions, FFT spectrograms, BRMS, Butterworth filtering, zero-phase filtfilt, anti-aliased decimation — numerically validated by 24 tests
+- the shell has an **Analysis** section driven by `dd_engine_plot_json`: FFT/spectrogram/coherence/transfer-function/BRMS/time plots are computed in Rust and rendered generically by `ScenePlotView` from `dd-render` scenes
 
 ## Repository Layout
 
@@ -45,8 +47,8 @@ Current implementation notes:
 - `docs/backend-api.md`: backend abstraction and data model contract
 - `crates/dd-domain`: core domain types and helpers
 - `crates/dd-backend`: source registry, queries, capabilities, and traits
-- `crates/dd-processing`: processing primitives and transforms
-- `crates/dd-render`: UI-independent plot scene model
+- `crates/dd-processing`: DSP core — Welch PSD/ASD with mean/median/decay averaging, coherence, transfer functions, FFT spectrograms, BRMS, Butterworth filtering with zero-phase filtfilt, anti-aliased decimation
+- `crates/dd-render`: UI-independent plot scene model (time/frequency coordinates, log axes, legends, positioned heatmaps) consumed by the shell via `dd_engine_plot_json`
 - `crates/dd-io-hdf5`: generic HDF5 mapping and real file-backed read adapter
 - `crates/dd-io-gwf`: GWF adapter with series-tier parsing, a low-level `FrameReader` boundary, and conditional native local Frame support
 - `crates/dd-ffi`: stable JSON/C ABI boundary for the shell to open sources, browse catalog data, and read neutral blocks
