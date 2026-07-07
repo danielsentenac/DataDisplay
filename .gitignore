@@ -12,3 +12,6 @@ conda-forge-staged-recipes-gwtc_analysis-v0.3.4/
 .idea/
 .vscode/
 *.iml
+
+# Local real-data fixtures (see crates/dd-ffi/tests/e2e_gwf.rs)
+/testdata/
