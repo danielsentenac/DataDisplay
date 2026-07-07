@@ -34,7 +34,7 @@ impl std::error::Error for ProcessingError {}
 /// Best-estimate sample rate: prefer the channel's declared rate (exact even
 /// when the integer-ns period cannot represent it, e.g. 16384 Hz), fall back
 /// to the regular axis period.
-pub(crate) fn series_sample_rate_hz(series: &Series1D) -> Result<f64, ProcessingError> {
+pub fn series_sample_rate_hz(series: &Series1D) -> Result<f64, ProcessingError> {
     if let Some(rate) = series.channel.sample_rate_hz {
         if rate > 0.0 {
             return Ok(rate);

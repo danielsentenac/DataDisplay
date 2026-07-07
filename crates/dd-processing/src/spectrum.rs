@@ -146,6 +146,38 @@ pub fn welch_spectrum(
     })
 }
 
+/// Restrict a spectrum to the `[fmin_hz, fmax_hz]` band (the original's
+/// per-plot frequency zoom). Returns an empty spectrum when the band does not
+/// overlap the axis.
+pub fn band_slice(spectrum: &Spectrum, fmin_hz: f64, fmax_hz: f64) -> Spectrum {
+    let axis = &spectrum.axis;
+    let mut sliced = spectrum.clone();
+    if axis.len == 0 || axis.step_hz <= 0.0 || fmax_hz < fmin_hz {
+        sliced.axis = FrequencyAxis::new(fmin_hz.max(axis.start_hz), axis.step_hz, 0);
+        sliced.values = Vec::new();
+        return sliced;
+    }
+
+    let first = ((fmin_hz - axis.start_hz) / axis.step_hz).ceil().max(0.0) as usize;
+    let last_in_band = ((fmax_hz - axis.start_hz) / axis.step_hz).floor();
+    if last_in_band < first as f64 {
+        sliced.axis = FrequencyAxis::new(axis.frequency_hz(first.min(axis.len)), axis.step_hz, 0);
+        sliced.values = Vec::new();
+        return sliced;
+    }
+    let last = (last_in_band as usize).min(axis.len - 1);
+
+    sliced.axis = FrequencyAxis::new(axis.frequency_hz(first), axis.step_hz, last + 1 - first);
+    sliced.values = spectrum.values[first..=last].to_vec();
+    sliced
+        .metadata
+        .insert(meta::FMIN_HZ.to_string(), fmin_hz.to_string());
+    sliced
+        .metadata
+        .insert(meta::FMAX_HZ.to_string(), fmax_hz.to_string());
+    sliced
+}
+
 /// Cumulative RMS curve of a spectral density: at each frequency, the RMS
 /// contributed by all bins integrated from one end up to that frequency (the
 /// curve dataDisplay superposes on spectra). `descending` integrates from the

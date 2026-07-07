@@ -5,11 +5,12 @@
 use serde::{Deserialize, Serialize};
 
 use dd_backend::{Aggregation, ReadQuery};
-use dd_domain::{DataBlock, Series1D, Spectrum, TimeRange};
+use dd_domain::{DataBlock, Grid2D, Series1D, Spectrum, TimeRange};
 use dd_processing::{
-    bandpass, brms, coherence as dsp_coherence, cross_analysis, cumulative_rms, downsample_mean,
-    spectrogram_with, spectrum_to_db, welch_spectrum, Averaging, BrmsParams, CrossParams,
-    ProcessingError, SpectrogramParams, SpectrumParams, SpectrumScaling, Window,
+    band_slice, bandpass, brms, cross_analysis, cumulative_rms, decimate, downsample_mean,
+    phase_to_delay, resample_linear, series_sample_rate_hz, spectrogram_with, spectrum_to_db,
+    welch_spectrum, Averaging, BrmsParams, CrossParams, ProcessingError, SpectrogramParams,
+    SpectrumParams, SpectrumScaling, Window,
 };
 use dd_render::{
     spectrogram_scene, spectrum_scene, time_series_scene, AxisSpec, PlotKind, PlotLayer,
@@ -69,16 +70,28 @@ pub struct TimePlotSpec {
     pub filter_order: usize,
     #[serde(default)]
     pub remove_dc: bool,
+    /// Resample to this rate (anti-aliased when decimating).
+    #[serde(default)]
+    pub resample_hz: Option<f64>,
     /// Downsample for display when the series is longer than this.
     #[serde(default)]
     pub max_points: Option<usize>,
+    #[serde(default)]
+    pub y_min: Option<f64>,
+    #[serde(default)]
+    pub y_max: Option<f64>,
     #[serde(default)]
     pub log_y: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct SpectrumPlotSpec {
+    /// FFT length in samples; alternatively give `segment_duration_s`.
+    #[serde(default)]
     pub segment_len: usize,
+    /// FFT length in seconds (the original's unit); wins over `segment_len`.
+    #[serde(default)]
+    pub segment_duration_s: Option<f64>,
     #[serde(default = "default_overlap")]
     pub overlap: f64,
     #[serde(default = "default_window")]
@@ -100,6 +113,15 @@ pub struct SpectrumPlotSpec {
     /// Superpose the integrated-RMS curve (ignored when `db`).
     #[serde(default)]
     pub rms_curve: bool,
+    /// Displayed frequency band (the original's fmin/fmax zoom).
+    #[serde(default)]
+    pub fmin_hz: Option<f64>,
+    #[serde(default)]
+    pub fmax_hz: Option<f64>,
+    #[serde(default)]
+    pub y_min: Option<f64>,
+    #[serde(default)]
+    pub y_max: Option<f64>,
     #[serde(default = "default_true")]
     pub log_x: bool,
     #[serde(default = "default_true")]
@@ -108,8 +130,14 @@ pub struct SpectrumPlotSpec {
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct SpectrogramPlotSpec {
+    #[serde(default)]
     pub segment_len: usize,
+    #[serde(default)]
+    pub segment_duration_s: Option<f64>,
+    #[serde(default)]
     pub step_len: usize,
+    #[serde(default)]
+    pub step_duration_s: Option<f64>,
     #[serde(default = "default_window")]
     pub window: String,
     #[serde(default)]
@@ -121,13 +149,26 @@ pub struct SpectrogramPlotSpec {
     /// The original's "medY": divide each frequency row by its time median.
     #[serde(default)]
     pub median_normalize: bool,
+    /// Displayed frequency band (rows outside are dropped).
+    #[serde(default)]
+    pub fmin_hz: Option<f64>,
+    #[serde(default)]
+    pub fmax_hz: Option<f64>,
+    /// Manual color scale (the original's zmin/zmax; autoZ when unset).
+    #[serde(default)]
+    pub z_min: Option<f64>,
+    #[serde(default)]
+    pub z_max: Option<f64>,
     #[serde(default = "default_true")]
     pub log_z: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct CrossPlotSpec {
+    #[serde(default)]
     pub segment_len: usize,
+    #[serde(default)]
+    pub segment_duration_s: Option<f64>,
     #[serde(default = "default_overlap")]
     pub overlap: f64,
     #[serde(default = "default_window")]
@@ -140,6 +181,26 @@ pub struct CrossPlotSpec {
     pub decay_count: Option<f64>,
     #[serde(default)]
     pub remove_dc: bool,
+    /// Time shift applied to channel B in seconds: positive compares A(t)
+    /// with B(t + shift) (the original's inter-channel time shift).
+    #[serde(default)]
+    pub shift_b_s: f64,
+    /// Coherence only: plot sqrt(coherence).
+    #[serde(default)]
+    pub sqrt: bool,
+    /// Transfer function only: show delay (s) instead of phase (rad).
+    #[serde(default)]
+    pub phase_as_delay: bool,
+    /// Displayed frequency band.
+    #[serde(default)]
+    pub fmin_hz: Option<f64>,
+    #[serde(default)]
+    pub fmax_hz: Option<f64>,
+    /// Manual y range of the coherence/module pane.
+    #[serde(default)]
+    pub y_min: Option<f64>,
+    #[serde(default)]
+    pub y_max: Option<f64>,
     #[serde(default = "default_true")]
     pub log_x: bool,
     /// Log module axis (transfer function only).
@@ -151,12 +212,22 @@ pub struct CrossPlotSpec {
 pub struct BrmsPlotSpec {
     pub fmin_hz: f64,
     pub fmax_hz: f64,
+    #[serde(default)]
     pub segment_len: usize,
+    #[serde(default)]
+    pub segment_duration_s: Option<f64>,
+    #[serde(default)]
     pub step_len: usize,
+    #[serde(default)]
+    pub step_duration_s: Option<f64>,
     #[serde(default = "default_window")]
     pub window: String,
     #[serde(default)]
     pub remove_dc: bool,
+    #[serde(default)]
+    pub y_min: Option<f64>,
+    #[serde(default)]
+    pub y_max: Option<f64>,
     #[serde(default)]
     pub log_y: bool,
 }
@@ -336,6 +407,142 @@ fn read_series(
     }
 }
 
+/// Resolve a segment/step length given either samples or seconds (seconds
+/// win, matching the original's parameter panels).
+fn resolve_len(
+    len_samples: usize,
+    duration_s: Option<f64>,
+    sample_rate_hz: f64,
+    what: &str,
+) -> EngineResult<usize> {
+    if let Some(duration) = duration_s {
+        let resolved = (duration * sample_rate_hz).round();
+        if resolved < 2.0 {
+            return Err(EngineError::invalid_query(format!(
+                "{what} of {duration} s is under 2 samples at {sample_rate_hz} Hz"
+            )));
+        }
+        return Ok(resolved as usize);
+    }
+    if len_samples >= 2 {
+        return Ok(len_samples);
+    }
+    Err(EngineError::invalid_query(format!(
+        "{what} must be given in samples (>= 2) or seconds"
+    )))
+}
+
+fn sample_rate(series: &Series1D) -> EngineResult<f64> {
+    series_sample_rate_hz(series).map_err(processing_error)
+}
+
+fn apply_y_range(scene: &mut PlotScene, y_min: Option<f64>, y_max: Option<f64>) {
+    if y_min.is_none() && y_max.is_none() {
+        return;
+    }
+    let (data_min, data_max) = scene.y_axis.range.unwrap_or((0.0, 1.0));
+    scene.y_axis.range = Some((y_min.unwrap_or(data_min), y_max.unwrap_or(data_max)));
+}
+
+fn maybe_band_slice(
+    spectrum: Spectrum,
+    fmin_hz: Option<f64>,
+    fmax_hz: Option<f64>,
+) -> EngineResult<Spectrum> {
+    if fmin_hz.is_none() && fmax_hz.is_none() {
+        return Ok(spectrum);
+    }
+    let fmin = fmin_hz.unwrap_or(spectrum.axis.start_hz);
+    let fmax = fmax_hz.unwrap_or_else(|| spectrum.axis.last_frequency_hz().unwrap_or(fmin));
+    let sliced = band_slice(&spectrum, fmin, fmax);
+    if sliced.is_empty() {
+        return Err(EngineError::invalid_query(format!(
+            "frequency band [{fmin}, {fmax}] Hz contains no spectrum bin"
+        )));
+    }
+    Ok(sliced)
+}
+
+/// Align channel B onto A shifted by `shift_s`: positive shift compares
+/// A(t) with B(t + shift). Returns the trimmed pair.
+fn shift_pair(
+    a: &Series1D,
+    b: &Series1D,
+    shift_s: f64,
+) -> EngineResult<(Series1D, Series1D)> {
+    if shift_s == 0.0 {
+        return Ok((a.clone(), b.clone()));
+    }
+    let rate = sample_rate(b)?;
+    let offset = (shift_s * rate).round() as i64;
+    let drop_from = |series: &Series1D, count: usize| -> EngineResult<Series1D> {
+        if count >= series.len() {
+            return Err(EngineError::invalid_query(format!(
+                "time shift of {shift_s} s exceeds the data length"
+            )));
+        }
+        let mut shifted = series.clone();
+        shifted.values = series.values[count..].to_vec();
+        if let dd_domain::TimeAxis::Regular {
+            start_ns,
+            sample_period_ns,
+            ..
+        } = &series.axis
+        {
+            shifted.axis = dd_domain::TimeAxis::Regular {
+                start_ns: start_ns.saturating_add(sample_period_ns * count as i64),
+                sample_period_ns: *sample_period_ns,
+                len: shifted.values.len(),
+            };
+        }
+        Ok(shifted)
+    };
+
+    if offset > 0 {
+        Ok((a.clone(), drop_from(b, offset as usize)?))
+    } else {
+        Ok((drop_from(a, (-offset) as usize)?, b.clone()))
+    }
+}
+
+/// Drop spectrogram rows outside `[fmin, fmax]` (column-major grid).
+fn slice_grid_rows(grid: &Grid2D, fmin_hz: f64, fmax_hz: f64) -> EngineResult<Grid2D> {
+    let y0 = grid
+        .metadata
+        .get("dd_y_origin_hz")
+        .and_then(|value| value.parse::<f64>().ok())
+        .unwrap_or(0.0);
+    let dy = grid
+        .metadata
+        .get("dd_y_step_hz")
+        .and_then(|value| value.parse::<f64>().ok())
+        .unwrap_or(1.0);
+
+    let first = (((fmin_hz - y0) / dy).ceil().max(0.0)) as usize;
+    let last_in_band = ((fmax_hz - y0) / dy).floor();
+    if grid.height == 0 || last_in_band < first as f64 {
+        return Err(EngineError::invalid_query(format!(
+            "frequency band [{fmin_hz}, {fmax_hz}] Hz contains no spectrogram row"
+        )));
+    }
+    let last = (last_in_band as usize).min(grid.height - 1);
+
+    let rows = last + 1 - first;
+    let mut values = Vec::with_capacity(grid.width * rows);
+    for column in 0..grid.width {
+        let base = column * grid.height;
+        values.extend_from_slice(&grid.values[base + first..base + last + 1]);
+    }
+
+    let mut sliced = grid.clone();
+    sliced.height = rows;
+    sliced.values = values;
+    sliced
+        .metadata
+        .insert("dd_y_origin_hz".to_string(), (y0 + dy * first as f64).to_string());
+    Ok(sliced)
+}
+
 fn expect_channels(request: &PlotRequest, expected: usize, kind: &str) -> EngineResult<()> {
     if request.channels.len() != expected {
         return Err(EngineError::invalid_query(format!(
@@ -405,6 +612,15 @@ fn plot_time(
         } else {
             one.clone()
         };
+        if let Some(target_hz) = spec.resample_hz {
+            let rate = sample_rate(&current)?;
+            if target_hz < rate * 0.999 {
+                let factor = (rate / target_hz).round().max(2.0) as usize;
+                current = decimate(&current, factor).map_err(processing_error)?;
+            } else if target_hz > rate * 1.001 {
+                current = resample_linear(&current, target_hz).map_err(processing_error)?;
+            }
+        }
         if spec.remove_dc && !current.is_empty() {
             let mean = current.values.iter().sum::<f64>() / current.len() as f64;
             for value in current.values.iter_mut() {
@@ -424,12 +640,13 @@ fn plot_time(
     let refs: Vec<&Series1D> = processed.iter().collect();
     let mut scene = time_series_scene(&refs, title.clone());
     scene.y_axis.log_scale = spec.log_y;
+    apply_y_range(&mut scene, spec.y_min, spec.y_max);
     Ok((title, vec![scene]))
 }
 
-fn spectrum_params(spec: &SpectrumPlotSpec) -> EngineResult<SpectrumParams> {
+fn spectrum_params(spec: &SpectrumPlotSpec, segment_len: usize) -> EngineResult<SpectrumParams> {
     Ok(SpectrumParams {
-        segment_len: spec.segment_len,
+        segment_len,
         overlap: spec.overlap,
         window: parse_window(&spec.window)?,
         averaging: parse_averaging(&spec.averaging, spec.max_segments, spec.decay_count)?,
@@ -446,10 +663,20 @@ fn plot_fft(
     series: &[Series1D],
     spec: &SpectrumPlotSpec,
 ) -> EngineResult<(String, Vec<PlotScene>)> {
-    let params = spectrum_params(spec)?;
+    let segment_len = resolve_len(
+        spec.segment_len,
+        spec.segment_duration_s,
+        sample_rate(&series[0])?,
+        "FFT length",
+    )?;
+    let params = spectrum_params(spec, segment_len)?;
     let mut spectra: Vec<Spectrum> = series
         .iter()
-        .map(|one| welch_spectrum(one, &params).map_err(processing_error))
+        .map(|one| {
+            welch_spectrum(one, &params)
+                .map_err(processing_error)
+                .and_then(|spectrum| maybe_band_slice(spectrum, spec.fmin_hz, spec.fmax_hz))
+        })
         .collect::<EngineResult<_>>()?;
 
     if spec.rms_curve && !spec.db {
@@ -465,7 +692,8 @@ fn plot_fft(
 
     let title = format!("FFT {}", channel_names(series));
     let refs: Vec<&Spectrum> = spectra.iter().collect();
-    let scene = spectrum_scene(&refs, title.clone(), spec.log_x, spec.log_y && !spec.db);
+    let mut scene = spectrum_scene(&refs, title.clone(), spec.log_x, spec.log_y && !spec.db);
+    apply_y_range(&mut scene, spec.y_min, spec.y_max);
     Ok((title, vec![scene]))
 }
 
@@ -473,9 +701,15 @@ fn plot_spectrogram(
     series: &Series1D,
     spec: &SpectrogramPlotSpec,
 ) -> EngineResult<(String, Vec<PlotScene>)> {
+    let rate = sample_rate(series)?;
     let params = SpectrogramParams {
-        segment_len: spec.segment_len,
-        step_len: spec.step_len,
+        segment_len: resolve_len(
+            spec.segment_len,
+            spec.segment_duration_s,
+            rate,
+            "spectrogram FFT length",
+        )?,
+        step_len: resolve_len(spec.step_len, spec.step_duration_s, rate, "spectrogram step")?,
         window: parse_window(&spec.window)?,
         remove_dc: spec.remove_dc,
         scaling: if spec.amplitude {
@@ -486,15 +720,32 @@ fn plot_spectrogram(
         averages_per_column: spec.averages_per_column.unwrap_or(1),
         median_normalize_rows: spec.median_normalize,
     };
-    let grid = spectrogram_with(series, &params).map_err(processing_error)?;
-    let scene = spectrogram_scene(&grid, spec.log_z);
+    let mut grid = spectrogram_with(series, &params).map_err(processing_error)?;
+    if spec.fmin_hz.is_some() || spec.fmax_hz.is_some() {
+        grid = slice_grid_rows(
+            &grid,
+            spec.fmin_hz.unwrap_or(0.0),
+            spec.fmax_hz.unwrap_or(rate / 2.0),
+        )?;
+    }
+
+    let mut scene = spectrogram_scene(&grid, spec.log_z);
+    if spec.z_min.is_some() || spec.z_max.is_some() {
+        if let Some(z_axis) = scene.z_axis.as_mut() {
+            let (data_min, data_max) = z_axis.range.unwrap_or((0.0, 1.0));
+            z_axis.range = Some((
+                spec.z_min.unwrap_or(data_min),
+                spec.z_max.unwrap_or(data_max),
+            ));
+        }
+    }
     let title = format!("Spectrogram {}", series.channel.display_name);
     Ok((title, vec![scene]))
 }
 
-fn cross_params(spec: &CrossPlotSpec) -> EngineResult<CrossParams> {
+fn cross_params(spec: &CrossPlotSpec, segment_len: usize) -> EngineResult<CrossParams> {
     Ok(CrossParams {
-        segment_len: spec.segment_len,
+        segment_len,
         overlap: spec.overlap,
         window: parse_window(&spec.window)?,
         averaging: parse_averaging(&spec.averaging, spec.max_segments, spec.decay_count)?,
@@ -507,14 +758,34 @@ fn plot_coherence(
     b: &Series1D,
     spec: &CrossPlotSpec,
 ) -> EngineResult<(String, Vec<PlotScene>)> {
-    let result = dsp_coherence(a, b, &cross_params(spec)?).map_err(processing_error)?;
+    let (a, b) = shift_pair(a, b, spec.shift_b_s)?;
+    let segment_len = resolve_len(
+        spec.segment_len,
+        spec.segment_duration_s,
+        sample_rate(&a)?,
+        "FFT length",
+    )?;
+    let analysis =
+        cross_analysis(&a, &b, &cross_params(spec, segment_len)?).map_err(processing_error)?;
+    let mut result = maybe_band_slice(analysis.coherence, spec.fmin_hz, spec.fmax_hz)?;
+
+    let label = if spec.sqrt {
+        for value in result.values.iter_mut() {
+            *value = value.max(0.0).sqrt();
+        }
+        "sqrt(Coherence)"
+    } else {
+        "Coherence"
+    };
+
     let title = format!(
-        "Coherence {} / {}",
+        "{label} {} / {}",
         a.channel.display_name, b.channel.display_name
     );
     let mut scene = spectrum_scene(&[&result], title.clone(), spec.log_x, false);
     scene.y_axis.range = Some((0.0, 1.0));
-    scene.y_axis.label = "Coherence".to_string();
+    scene.y_axis.label = label.to_string();
+    apply_y_range(&mut scene, spec.y_min, spec.y_max);
     Ok((title, vec![scene]))
 }
 
@@ -523,30 +794,47 @@ fn plot_transfer_function(
     b: &Series1D,
     spec: &CrossPlotSpec,
 ) -> EngineResult<(String, Vec<PlotScene>)> {
-    let analysis = cross_analysis(a, b, &cross_params(spec)?).map_err(processing_error)?;
+    let (a, b) = shift_pair(a, b, spec.shift_b_s)?;
+    let segment_len = resolve_len(
+        spec.segment_len,
+        spec.segment_duration_s,
+        sample_rate(&a)?,
+        "FFT length",
+    )?;
+    let analysis =
+        cross_analysis(&a, &b, &cross_params(spec, segment_len)?).map_err(processing_error)?;
     let title = format!(
         "Transfer function {} -> {}",
         a.channel.display_name, b.channel.display_name
     );
 
+    let module_spectrum =
+        maybe_band_slice(analysis.transfer.module, spec.fmin_hz, spec.fmax_hz)?;
     let mut module = spectrum_scene(
-        &[&analysis.transfer.module],
+        &[&module_spectrum],
         format!("{title} (module)"),
         spec.log_x,
         spec.log_y,
     );
     module.y_axis.label = "Module".to_string();
+    apply_y_range(&mut module, spec.y_min, spec.y_max);
 
-    let mut phase = spectrum_scene(
-        &[&analysis.transfer.phase_rad],
-        format!("{title} (phase)"),
-        spec.log_x,
-        false,
-    );
-    phase.y_axis.label = "Phase".to_string();
-    phase.y_axis.range = Some((-std::f64::consts::PI, std::f64::consts::PI));
+    let second = if spec.phase_as_delay {
+        let delay =
+            maybe_band_slice(phase_to_delay(&analysis.transfer.phase_rad), spec.fmin_hz, spec.fmax_hz)?;
+        let mut scene = spectrum_scene(&[&delay], format!("{title} (delay)"), spec.log_x, false);
+        scene.y_axis.label = "Delay".to_string();
+        scene
+    } else {
+        let phase =
+            maybe_band_slice(analysis.transfer.phase_rad, spec.fmin_hz, spec.fmax_hz)?;
+        let mut scene = spectrum_scene(&[&phase], format!("{title} (phase)"), spec.log_x, false);
+        scene.y_axis.label = "Phase".to_string();
+        scene.y_axis.range = Some((-std::f64::consts::PI, std::f64::consts::PI));
+        scene
+    };
 
-    Ok((title, vec![module, phase]))
+    Ok((title, vec![module, second]))
 }
 
 #[cfg(test)]
@@ -764,6 +1052,153 @@ mod tests {
     }
 
     #[test]
+    fn fft_band_zoom_and_duration_based_length() {
+        let (engine, source_id) = engine_with_sines();
+        let response = engine
+            .plot(PlotRequest {
+                channels: vec![channel(source_id, "chan.a")],
+                time_range: full_range(),
+                spec: PlotSpec::Fft(
+                    serde_json::from_str(
+                        r#"{"segment_duration_s": 1.0, "fmin_hz": 40, "fmax_hz": 60}"#,
+                    )
+                    .unwrap(),
+                ),
+                allow_gaps: false,
+            })
+            .expect("fft plot should succeed");
+
+        let FfiPlotLayer::Line { xs, ys, .. } = &response.scenes[0].layers[0] else {
+            panic!("expected line layer");
+        };
+        // 1.0 s at 1 kHz -> df = 1 Hz; band [40, 60] -> 21 bins from 40 Hz.
+        assert_eq!(xs.len(), 21);
+        assert!((xs[0] - 40.0).abs() < 1e-9);
+        let peak = ys
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+            .unwrap()
+            .0;
+        assert!((xs[peak] - 50.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn coherence_sqrt_and_tf_delay_options() {
+        let (engine, source_id) = engine_with_sines();
+        let response = engine
+            .plot(PlotRequest {
+                channels: vec![channel(source_id, "chan.a"), channel(source_id, "chan.a")],
+                time_range: full_range(),
+                spec: PlotSpec::Coherence(
+                    serde_json::from_str(r#"{"segment_len": 500, "sqrt": true}"#).unwrap(),
+                ),
+                allow_gaps: false,
+            })
+            .expect("sqrt coherence should succeed");
+        assert_eq!(response.scenes[0].y_axis.label, "sqrt(Coherence)");
+
+        let response = engine
+            .plot(PlotRequest {
+                channels: vec![channel(source_id, "chan.a"), channel(source_id, "chan.b")],
+                time_range: full_range(),
+                spec: PlotSpec::TransferFunction(
+                    serde_json::from_str(r#"{"segment_len": 500, "phase_as_delay": true}"#)
+                        .unwrap(),
+                ),
+                allow_gaps: false,
+            })
+            .expect("tf with delay pane should succeed");
+        assert_eq!(response.scenes.len(), 2);
+        assert_eq!(response.scenes[1].y_axis.label, "Delay");
+        assert_eq!(response.scenes[1].y_axis.unit.as_deref(), Some("s"));
+    }
+
+    #[test]
+    fn spectrogram_band_zoom_and_manual_color_scale() {
+        let (engine, source_id) = engine_with_sines();
+        let response = engine
+            .plot(PlotRequest {
+                channels: vec![channel(source_id, "chan.a")],
+                time_range: full_range(),
+                spec: PlotSpec::Spectrogram(
+                    serde_json::from_str(
+                        r#"{"segment_len": 200, "step_len": 100,
+                            "fmin_hz": 25, "fmax_hz": 100, "z_min": 1e-9, "z_max": 1.0}"#,
+                    )
+                    .unwrap(),
+                ),
+                allow_gaps: false,
+            })
+            .expect("spectrogram plot should succeed");
+
+        let scene = &response.scenes[0];
+        // df = 5 Hz: rows 5..=20 survive the [25, 100] Hz zoom.
+        let FfiPlotLayer::Heatmap { height, y0, .. } = &scene.layers[0] else {
+            panic!("expected heatmap layer");
+        };
+        assert_eq!(*height, 16);
+        assert!((y0 - 25.0).abs() < 1e-9);
+        assert_eq!(
+            scene.z_axis.as_ref().unwrap().range,
+            Some((1e-9, 1.0))
+        );
+    }
+
+    #[test]
+    fn time_plot_resamples_and_honours_manual_y_range() {
+        let (engine, source_id) = engine_with_sines();
+        let response = engine
+            .plot(PlotRequest {
+                channels: vec![channel(source_id, "chan.a")],
+                time_range: full_range(),
+                spec: PlotSpec::Time(TimePlotSpec {
+                    resample_hz: Some(200.0),
+                    y_min: Some(-3.0),
+                    y_max: Some(3.0),
+                    ..TimePlotSpec::default()
+                }),
+                allow_gaps: false,
+            })
+            .expect("time plot should succeed");
+
+        let scene = &response.scenes[0];
+        assert_eq!(scene.y_axis.range, Some((-3.0, 3.0)));
+        let FfiPlotLayer::Line { xs, .. } = &scene.layers[0] else {
+            panic!("expected line layer");
+        };
+        // 8000 samples at 1 kHz decimated by 5 -> 1600 points.
+        assert_eq!(xs.len(), 1600);
+    }
+
+    #[test]
+    fn cross_time_shift_is_applied() {
+        let (engine, source_id) = engine_with_sines();
+        // chan.a vs chan.a shifted by 10 ms: at 50 Hz that is a half period,
+        // so the transfer-function phase at the 50 Hz bin flips to ~pi.
+        let response = engine
+            .plot(PlotRequest {
+                channels: vec![channel(source_id, "chan.a"), channel(source_id, "chan.a")],
+                time_range: full_range(),
+                spec: PlotSpec::TransferFunction(
+                    serde_json::from_str(r#"{"segment_len": 500, "shift_b_s": 0.01}"#)
+                        .unwrap(),
+                ),
+                allow_gaps: false,
+            })
+            .expect("shifted tf should succeed");
+
+        let FfiPlotLayer::Line { ys, .. } = &response.scenes[1].layers[0] else {
+            panic!("expected line layer");
+        };
+        assert!(
+            (ys[25].abs() - std::f64::consts::PI).abs() < 0.05,
+            "phase at 50 Hz: {}",
+            ys[25]
+        );
+    }
+
+    #[test]
     fn plot_request_json_contract() {
         let request: PlotRequest = serde_json::from_str(
             r#"{
@@ -797,11 +1232,17 @@ mod tests {
 }
 
 fn plot_brms(series: &[Series1D], spec: &BrmsPlotSpec) -> EngineResult<(String, Vec<PlotScene>)> {
+    let rate = sample_rate(&series[0])?;
     let params = BrmsParams {
         fmin_hz: spec.fmin_hz,
         fmax_hz: spec.fmax_hz,
-        segment_len: spec.segment_len,
-        step_len: spec.step_len,
+        segment_len: resolve_len(
+            spec.segment_len,
+            spec.segment_duration_s,
+            rate,
+            "BRMS FFT length",
+        )?,
+        step_len: resolve_len(spec.step_len, spec.step_duration_s, rate, "BRMS step")?,
         window: parse_window(&spec.window)?,
         remove_dc: spec.remove_dc,
     };
@@ -819,5 +1260,6 @@ fn plot_brms(series: &[Series1D], spec: &BrmsPlotSpec) -> EngineResult<(String, 
     let refs: Vec<&Series1D> = trends.iter().collect();
     let mut scene = time_series_scene(&refs, title.clone());
     scene.y_axis.log_scale = spec.log_y;
+    apply_y_range(&mut scene, spec.y_min, spec.y_max);
     Ok((title, vec![scene]))
 }

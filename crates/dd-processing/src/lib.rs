@@ -19,14 +19,14 @@ pub use cross::{
     coherence, cross_analysis, phase_to_delay, transfer_function, CrossAnalysis, CrossParams,
     TransferFunction,
 };
-pub use error::ProcessingError;
+pub use error::{series_sample_rate_hz, ProcessingError};
 pub use filter::{
     bandpass, butterworth_sos, decimate, filtfilt, highpass, lowpass, resample_linear,
     sos_response, sosfilt, Biquad, FilterKind,
 };
 pub use spectrogram::{spectrogram, spectrogram_with, SpectrogramParams};
 pub use spectrum::{
-    cumulative_rms, meta, spectrum_to_db, welch_spectrum, Averaging, SpectrumParams,
+    band_slice, cumulative_rms, meta, spectrum_to_db, welch_spectrum, Averaging, SpectrumParams,
     SpectrumScaling,
 };
 pub use window::Window;
