@@ -1,6 +1,37 @@
 //! Processing primitives for DATADISPLAY.
+//!
+//! Frequency-domain analysis follows the semantics of the original
+//! dataDisplay/Frv stack: Welch-segmented, window-normalized one-sided
+//! spectral densities with mean, median (bias-corrected) or
+//! exponential-decay averaging.
 
-use dd_domain::{ChannelDescriptor, Grid2D, Metadata, Series1D, TimeAxis, TimeRange};
+mod brms;
+mod cross;
+mod error;
+mod filter;
+mod segment;
+mod spectrogram;
+mod spectrum;
+mod window;
+
+pub use brms::{brms, BrmsParams};
+pub use cross::{
+    coherence, cross_analysis, phase_to_delay, transfer_function, CrossAnalysis, CrossParams,
+    TransferFunction,
+};
+pub use error::ProcessingError;
+pub use filter::{
+    bandpass, butterworth_sos, decimate, filtfilt, highpass, lowpass, resample_linear,
+    sos_response, sosfilt, Biquad, FilterKind,
+};
+pub use spectrogram::{spectrogram, spectrogram_with, SpectrogramParams};
+pub use spectrum::{
+    cumulative_rms, meta, spectrum_to_db, welch_spectrum, Averaging, SpectrumParams,
+    SpectrumScaling,
+};
+pub use window::Window;
+
+use dd_domain::{Series1D, TimeAxis};
 
 pub fn downsample_mean(series: &Series1D, bucket_size: usize) -> Series1D {
     if bucket_size <= 1 || series.values.is_empty() {
@@ -47,12 +78,16 @@ pub fn moving_rms(series: &Series1D, window_size: usize) -> Series1D {
     }
 
     let mut values = Vec::with_capacity(series.values.len());
+    let mut sum_of_squares = 0.0;
     for index in 0..series.values.len() {
-        let start = index.saturating_sub(window_size - 1);
-        let window = &series.values[start..=index];
-        let rms =
-            (window.iter().map(|value| value * value).sum::<f64>() / window.len() as f64).sqrt();
-        values.push(rms);
+        let sample = series.values[index];
+        sum_of_squares += sample * sample;
+        if index >= window_size {
+            let leaving = series.values[index - window_size];
+            sum_of_squares -= leaving * leaving;
+        }
+        let count = (index + 1).min(window_size);
+        values.push((sum_of_squares.max(0.0) / count as f64).sqrt());
     }
 
     Series1D {
@@ -60,67 +95,5 @@ pub fn moving_rms(series: &Series1D, window_size: usize) -> Series1D {
         axis: series.axis.clone(),
         values,
         metadata: series.metadata.clone(),
-    }
-}
-
-pub fn spectrogram(series: &Series1D, window_size: usize, step_size: usize) -> Grid2D {
-    let safe_window = window_size.max(1);
-    let safe_step = step_size.max(1);
-    let windows = if series.values.len() < safe_window {
-        1
-    } else {
-        1 + (series.values.len() - safe_window) / safe_step
-    };
-
-    let bins = (safe_window / 2).max(8);
-    let mut values = Vec::with_capacity(windows * bins);
-
-    for window_index in 0..windows {
-        let start = window_index * safe_step;
-        let end = (start + safe_window).min(series.values.len());
-        let slice = &series.values[start..end];
-        let energy = if slice.is_empty() {
-            0.0
-        } else {
-            slice.iter().map(|value| value * value).sum::<f64>() / slice.len() as f64
-        };
-
-        for bin in 0..bins {
-            let taper = 1.0 - (bin as f32 / bins as f32) * 0.7;
-            values.push((energy as f32) * taper);
-        }
-    }
-
-    let time_range = match &series.axis {
-        TimeAxis::Regular {
-            start_ns,
-            sample_period_ns,
-            len,
-        } => TimeRange::new(
-            *start_ns,
-            start_ns.saturating_add(sample_period_ns.saturating_mul(*len as i64)),
-        ),
-        TimeAxis::Irregular { timestamps_ns } => {
-            let start_ns = *timestamps_ns.first().unwrap_or(&0);
-            let end_ns = *timestamps_ns.last().unwrap_or(&start_ns);
-            TimeRange::new(start_ns, end_ns)
-        }
-    };
-
-    Grid2D {
-        channel: ChannelDescriptor {
-            id: format!("{}:spectrogram", series.channel.id),
-            display_name: format!("{} Spectrogram", series.channel.display_name),
-            unit: Some("power".to_string()),
-            sample_rate_hz: None,
-            metadata: Metadata::new(),
-        },
-        x_range: time_range,
-        y_label: "Frequency".to_string(),
-        y_unit: Some("bin".to_string()),
-        width: windows,
-        height: bins,
-        values,
-        metadata: Metadata::new(),
     }
 }

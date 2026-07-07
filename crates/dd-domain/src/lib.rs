@@ -222,6 +222,70 @@ impl From<Series1D> for SampledData {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+pub struct FrequencyAxis {
+    pub start_hz: f64,
+    pub step_hz: f64,
+    pub len: usize,
+}
+
+impl FrequencyAxis {
+    pub fn new(start_hz: f64, step_hz: f64, len: usize) -> Self {
+        Self {
+            start_hz,
+            step_hz,
+            len,
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    pub fn frequency_hz(&self, index: usize) -> f64 {
+        self.start_hz + self.step_hz * index as f64
+    }
+
+    pub fn last_frequency_hz(&self) -> Option<f64> {
+        if self.len == 0 {
+            None
+        } else {
+            Some(self.frequency_hz(self.len - 1))
+        }
+    }
+
+    pub fn frequencies(&self) -> impl Iterator<Item = f64> + '_ {
+        (0..self.len).map(|index| self.frequency_hz(index))
+    }
+}
+
+/// A frequency-domain series (spectrum, coherence, transfer-function module or
+/// phase, ...). `time_range` records the span of time-domain data the spectrum
+/// was computed from; quantity semantics (scaling, averaging, window) travel in
+/// `metadata` under `dd_*` keys so the type stays domain-neutral.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Spectrum {
+    pub channel: ChannelDescriptor,
+    pub time_range: TimeRange,
+    pub axis: FrequencyAxis,
+    pub values: Vec<f64>,
+    pub metadata: Metadata,
+}
+
+impl Spectrum {
+    pub fn len(&self) -> usize {
+        self.values.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.values.is_empty()
+    }
+
+    pub fn is_consistent(&self) -> bool {
+        self.axis.len == self.values.len()
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub struct Grid2D {
     pub channel: ChannelDescriptor,
     pub x_range: TimeRange,
@@ -294,6 +358,7 @@ impl EventSeries {
 pub enum DataBlock {
     Series1D(Series1D),
     Sampled(SampledData),
+    Spectrum(Spectrum),
     Grid2D(Grid2D),
     Volume3D(Volume3D),
     EventSeries(EventSeries),
@@ -304,6 +369,7 @@ impl DataBlock {
         match self {
             Self::Series1D(_) => "series1d",
             Self::Sampled(_) => "sampled",
+            Self::Spectrum(_) => "spectrum",
             Self::Grid2D(_) => "grid2d",
             Self::Volume3D(_) => "volume3d",
             Self::EventSeries(_) => "event_series",
@@ -314,6 +380,7 @@ impl DataBlock {
         match self {
             Self::Series1D(series) => &series.channel,
             Self::Sampled(sampled) => &sampled.channel,
+            Self::Spectrum(spectrum) => &spectrum.channel,
             Self::Grid2D(grid) => &grid.channel,
             Self::Volume3D(volume) => &volume.channel,
             Self::EventSeries(events) => &events.channel,
@@ -324,6 +391,7 @@ impl DataBlock {
         match self {
             Self::Series1D(series) => &series.metadata,
             Self::Sampled(sampled) => &sampled.metadata,
+            Self::Spectrum(spectrum) => &spectrum.metadata,
             Self::Grid2D(grid) => &grid.metadata,
             Self::Volume3D(volume) => &volume.metadata,
             Self::EventSeries(events) => &events.metadata,

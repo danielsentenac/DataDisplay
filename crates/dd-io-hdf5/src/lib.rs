@@ -691,6 +691,7 @@ fn stream_kind(block: &DataBlock) -> StreamKind {
     match block {
         DataBlock::Series1D(_) => StreamKind::Series1D,
         DataBlock::Sampled(_) => StreamKind::Sampled,
+        DataBlock::Spectrum(_) => StreamKind::Spectrum,
         DataBlock::Grid2D(_) => StreamKind::Grid2D,
         DataBlock::Volume3D(_) => StreamKind::Volume3D,
         DataBlock::EventSeries(_) => StreamKind::EventSeries,
@@ -701,6 +702,7 @@ fn block_sample_shape(block: &DataBlock) -> Vec<usize> {
     match block {
         DataBlock::Series1D(_) => Vec::new(),
         DataBlock::Sampled(sampled) => sampled.sample_shape.clone(),
+        DataBlock::Spectrum(_) => Vec::new(),
         DataBlock::Grid2D(_) => Vec::new(),
         DataBlock::Volume3D(_) => Vec::new(),
         DataBlock::EventSeries(_) => Vec::new(),
@@ -712,6 +714,9 @@ fn read_registered_dataset(dataset: &Hdf5Dataset, query: &ReadQuery) -> BackendR
         DataBlock::Series1D(series) => read_series(series, query),
         DataBlock::Sampled(_) => Err(BackendError::unsupported(
             "generic sampled payloads are not yet supported by the HDF5 adapter",
+        )),
+        DataBlock::Spectrum(_) => Err(BackendError::unsupported(
+            "stored spectrum datasets are not yet supported by the HDF5 adapter",
         )),
         DataBlock::Grid2D(grid) => read_grid(grid, query),
         DataBlock::Volume3D(volume) => read_volume(volume, query),

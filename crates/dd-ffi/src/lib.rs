@@ -12,7 +12,7 @@ use dd_backend::{
 };
 use dd_domain::{
     ChannelDescriptor, DataBlock, Event, EventSeries, Grid2D, Metadata, SampleAxis, SampledData,
-    Series1D, TimeAxis, TimeRange, Volume3D,
+    Series1D, Spectrum, TimeAxis, TimeRange, Volume3D,
 };
 use dd_io_gwf::{FflFactory, GwfFactory};
 use dd_io_hdf5::Hdf5Factory;
@@ -306,6 +306,7 @@ impl From<&ChannelDescriptor> for FfiChannelDescriptor {
 pub enum FfiStreamKind {
     Series1d,
     Sampled,
+    Spectrum,
     Grid2d,
     Volume3d,
     EventSeries,
@@ -316,6 +317,7 @@ impl From<StreamKind> for FfiStreamKind {
         match kind {
             StreamKind::Series1D => Self::Series1d,
             StreamKind::Sampled => Self::Sampled,
+            StreamKind::Spectrum => Self::Spectrum,
             StreamKind::Grid2D => Self::Grid2d,
             StreamKind::Volume3D => Self::Volume3d,
             StreamKind::EventSeries => Self::EventSeries,
@@ -369,7 +371,7 @@ pub struct FfiTimeRange {
 }
 
 impl FfiTimeRange {
-    fn into_domain(self) -> EngineResult<TimeRange> {
+    pub(crate) fn into_domain(self) -> EngineResult<TimeRange> {
         let range = TimeRange::new(self.start_ns, self.end_ns);
         if range.is_valid() {
             Ok(range)
@@ -481,6 +483,14 @@ pub enum FfiDataBlock {
         values: Vec<f64>,
         metadata: Metadata,
     },
+    Spectrum {
+        channel: FfiChannelDescriptor,
+        time_range: FfiTimeRange,
+        start_hz: f64,
+        step_hz: f64,
+        values: Vec<f64>,
+        metadata: Metadata,
+    },
     Grid2d {
         channel: FfiChannelDescriptor,
         x_range: FfiTimeRange,
@@ -533,6 +543,20 @@ impl From<DataBlock> for FfiDataBlock {
                 axis: axis.into(),
                 sample_shape,
                 sample_axes: sample_axes.into_iter().map(FfiSampleAxis::from).collect(),
+                values,
+                metadata,
+            },
+            DataBlock::Spectrum(Spectrum {
+                channel,
+                time_range,
+                axis,
+                values,
+                metadata,
+            }) => Self::Spectrum {
+                channel: channel.into(),
+                time_range: time_range.into(),
+                start_hz: axis.start_hz,
+                step_hz: axis.step_hz,
                 values,
                 metadata,
             },
@@ -830,6 +854,7 @@ impl DatadisplayEngine {
             .get(&source_id)
             .ok_or_else(|| EngineError::not_found(format!("source `{source_id}` is not open")))
     }
+
 }
 
 impl Default for DatadisplayEngine {

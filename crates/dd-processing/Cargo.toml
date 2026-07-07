@@ -6,6 +6,8 @@ license.workspace = true
 
 [dependencies]
 dd-domain = { path = "../dd-domain" }
+num-complex = "0.4.6"
+realfft = "3.5.0"
 
 [lib]
 path = "src/lib.rs"

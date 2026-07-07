@@ -92,6 +92,7 @@ impl SourceTarget {
 pub enum StreamKind {
     Series1D,
     Sampled,
+    Spectrum,
     Grid2D,
     Volume3D,
     EventSeries,
