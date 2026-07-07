@@ -1,5 +1,12 @@
 //! Stable ABI boundary between the Flutter shell and the Rust core.
 
+mod plot;
+
+pub use plot::{
+    BrmsPlotSpec, CrossPlotSpec, FfiAxisSpec, FfiPlotLayer, FfiPlotScene, PlotChannelRef,
+    PlotRequest, PlotResponse, PlotSpec, SpectrogramPlotSpec, SpectrumPlotSpec, TimePlotSpec,
+};
+
 use std::collections::BTreeMap;
 use std::ffi::{c_char, CStr, CString};
 use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -855,6 +862,20 @@ impl DatadisplayEngine {
             .ok_or_else(|| EngineError::not_found(format!("source `{source_id}` is not open")))
     }
 
+    pub(crate) fn read_block(
+        &self,
+        source_id: u64,
+        query: &ReadQuery,
+    ) -> EngineResult<dd_domain::DataBlock> {
+        let source = self.source_handle(source_id)?;
+        source.source.read(query).map_err(EngineError::from)
+    }
+
+    /// One-call plot pipeline: read the requested channels, run the DSP
+    /// described by the spec, and return ready-to-draw scenes.
+    pub fn plot(&self, request: PlotRequest) -> EngineResult<PlotResponse> {
+        plot::execute(self, request)
+    }
 }
 
 impl Default for DatadisplayEngine {
@@ -945,6 +966,16 @@ pub unsafe extern "C" fn dd_engine_read_json(
     request_json: *const c_char,
 ) -> *mut c_char {
     engine_json_call(handle, request_json, |engine, request| engine.read(request))
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn dd_engine_plot_json(
+    handle: *mut EngineHandle,
+    request_json: *const c_char,
+) -> *mut c_char {
+    engine_json_call(handle, request_json, |engine, request| {
+        engine.plot(request)
+    })
 }
 
 #[no_mangle]

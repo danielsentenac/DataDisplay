@@ -12,6 +12,8 @@ dd-io-gwf = { path = "../dd-io-gwf" }
 dd-io-tomcat = { path = "../dd-io-tomcat" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+dd-processing = { version = "0.1.0", path = "../dd-processing" }
+dd-render = { version = "0.1.0", path = "../dd-render" }
 
 [lib]
 path = "src/lib.rs"
