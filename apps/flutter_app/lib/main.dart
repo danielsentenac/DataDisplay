@@ -14,8 +14,14 @@ import 'package:image/image.dart' as img;
 import 'package:pdf/pdf.dart' as pdf_core;
 import 'package:pdf/widgets.dart' as pw;
 
+import 'src/analysis_deck.dart';
+import 'src/analysis_spec.dart';
 import 'src/datadisplay_backend.dart';
+import 'src/dy_config_import.dart';
 import 'src/native_datadisplay_backend.dart';
+import 'src/plot_scene.dart';
+import 'src/scene_plot_view.dart';
+import 'src/session_store.dart';
 import 'src/tomcat_live_poller.dart';
 
 const _defaultSourceUri =
@@ -60,6 +66,7 @@ enum WorkspaceSection {
   session('Session', Icons.space_dashboard_rounded),
   catalog('Catalog', Icons.view_list_rounded),
   plots('Plots', Icons.insights_rounded),
+  analysis('Analysis', Icons.query_stats_rounded),
   backends('Backends', Icons.storage_rounded);
 
   const WorkspaceSection(this.label, this.icon);
@@ -191,7 +198,16 @@ class SeriesDeckViewport {
 
 class WorkspaceController extends ChangeNotifier {
   WorkspaceController({NativeBackendLoadResult? nativeLoadResult})
-    : nativeLoadResult = nativeLoadResult ?? NativeDatadisplayBackend.tryLoad();
+    : nativeLoadResult =
+          nativeLoadResult ?? NativeDatadisplayBackend.tryLoad() {
+    _sessionAutosavePath = defaultSessionAutosavePath(
+      io.Platform.environment,
+      isWindows: io.Platform.isWindows,
+    );
+    final autosavePath = _sessionAutosavePath;
+    _lastSessionAvailable =
+        autosavePath != null && io.File(autosavePath).existsSync();
+  }
 
   final NativeBackendLoadResult nativeLoadResult;
 
@@ -319,6 +335,287 @@ class WorkspaceController extends ChangeNotifier {
       return 'No backend';
     }
     return 'Native dd-ffi';
+  }
+
+  DatadisplayBackendClient? get activeBackend => _activeBackend;
+
+  // ── Analysis deck (multi-pad plot grid) ───────────────────────────────────
+
+  List<AnalysisDeckEntry> _analysisDeck = const [];
+  int _analysisGridColumns = 2;
+  int _analysisGridRows = 2;
+
+  List<AnalysisDeckEntry> get analysisDeck => _analysisDeck;
+  int get analysisGridColumns => _analysisGridColumns;
+  int get analysisGridRows => _analysisGridRows;
+
+  void setAnalysisGrid(int columns, int rows) {
+    _analysisGridColumns = math.max(1, columns);
+    _analysisGridRows = math.max(1, rows);
+    _scheduleSessionAutosave();
+    notifyListeners();
+  }
+
+  void addAnalysisDeckEntry(AnalysisDeckEntry entry) {
+    _analysisDeck = [..._analysisDeck, entry];
+    _scheduleSessionAutosave();
+    notifyListeners();
+  }
+
+  void removeAnalysisDeckEntryAt(int index) {
+    if (index < 0 || index >= _analysisDeck.length) {
+      return;
+    }
+    _analysisDeck = [..._analysisDeck]..removeAt(index);
+    _scheduleSessionAutosave();
+    notifyListeners();
+  }
+
+  void moveAnalysisDeckEntry(int index, int delta) {
+    final target = index + delta;
+    if (index < 0 ||
+        index >= _analysisDeck.length ||
+        target < 0 ||
+        target >= _analysisDeck.length) {
+      return;
+    }
+    final next = [..._analysisDeck];
+    final entry = next.removeAt(index);
+    next.insert(target, entry);
+    _analysisDeck = next;
+    _scheduleSessionAutosave();
+    notifyListeners();
+  }
+
+  /// Runs the entry's saved configuration through the engine plot pipeline
+  /// against `timeRange`, storing the figure or error on the entry itself.
+  Future<void> computeAnalysisDeckEntry(
+    AnalysisDeckEntry entry,
+    TimeRange timeRange,
+  ) async {
+    final source = _source;
+    final backend = _activeBackend;
+    if (source == null || backend == null) {
+      entry.figure = null;
+      entry.error = 'Open a source before computing analysis plots.';
+      if (!_disposed) {
+        notifyListeners();
+      }
+      return;
+    }
+
+    entry.computing = true;
+    entry.error = null;
+    if (!_disposed) {
+      notifyListeners();
+    }
+    try {
+      final figure = await backend.plot(
+        channels: [
+          for (final channelId in entry.channelIds)
+            PlotChannelRef(sourceId: source.sourceId, channelId: channelId),
+        ],
+        timeRange: timeRange,
+        spec: entry.spec,
+      );
+      entry.figure = figure;
+    } on BackendException catch (error) {
+      entry.error = error.message;
+    } catch (error) {
+      entry.error = 'Plot request failed: $error';
+    } finally {
+      entry.computing = false;
+      if (!_disposed) {
+        notifyListeners();
+      }
+    }
+  }
+
+  Future<void> computeAllAnalysisDeck(TimeRange timeRange) async {
+    for (final entry in [..._analysisDeck]) {
+      await computeAnalysisDeckEntry(entry, timeRange);
+    }
+  }
+
+  // ── Session persistence ───────────────────────────────────────────────────
+
+  String? _sessionAutosavePath;
+  bool _lastSessionAvailable = false;
+  Timer? _sessionAutosaveTimer;
+
+  bool get lastSessionAvailable => _lastSessionAvailable;
+  String? get sessionAutosavePath => _sessionAutosavePath;
+
+  WorkspaceSession buildWorkspaceSession() {
+    final range = configuredReadWindowRange;
+    return WorkspaceSession(
+      sourceUris: [if (_source != null) _source!.uri],
+      gpsStartSeconds: range == null ? null : range.startNs / 1.0e9,
+      durationSeconds: range == null
+          ? null
+          : (range.endNs - range.startNs) / 1.0e9,
+      gridColumns: _analysisGridColumns,
+      gridRows: _analysisGridRows,
+      deck: [
+        for (final entry in _analysisDeck)
+          AnalysisDeckEntry(
+            label: entry.label,
+            channelIds: [...entry.channelIds],
+            spec: {...entry.spec},
+          ),
+      ],
+    );
+  }
+
+  /// Restores a saved session: reopens sources (per-source failures are
+  /// reported but do not abort), then the GPS window, grid and deck.
+  Future<List<String>> restoreWorkspaceSession(
+    WorkspaceSession session, {
+    bool computeAll = false,
+  }) async {
+    final warnings = <String>[];
+    await _openSessionSources(session.sourceUris, warnings);
+
+    if (session.gpsStartSeconds != null && _source != null) {
+      await applySelectedReadWindow(
+        gpsStartSeconds: session.gpsStartSeconds!,
+        windowSeconds: session.durationSeconds ?? _windowSeconds() ?? 10.0,
+      );
+    }
+    setAnalysisGrid(session.gridColumns, session.gridRows);
+    _analysisDeck = [
+      for (final entry in session.deck)
+        AnalysisDeckEntry(
+          label: entry.label,
+          channelIds: [...entry.channelIds],
+          spec: {...entry.spec},
+        ),
+    ];
+    notifyListeners();
+    _scheduleSessionAutosave();
+
+    if (computeAll) {
+      final range = configuredReadWindowRange;
+      if (range == null) {
+        warnings.add('Compute all skipped — no GPS window is configured.');
+      } else {
+        await computeAllAnalysisDeck(range);
+      }
+    }
+    return warnings;
+  }
+
+  /// Applies a parsed original-tool `dy.cfg` import (sources, timing, pad
+  /// grid, deck). Returns the parser warnings plus any apply-time warnings.
+  Future<List<String>> applyDyConfigImport(
+    DyConfigImportResult result, {
+    bool computeAll = false,
+  }) async {
+    final warnings = [...result.warnings];
+    await _openSessionSources(result.sourceUris, warnings);
+
+    if (result.gridColumns != null && result.gridRows != null) {
+      setAnalysisGrid(result.gridColumns!, result.gridRows!);
+    }
+    if (result.gpsStartSeconds != null && _source != null) {
+      await applySelectedReadWindow(
+        gpsStartSeconds: result.gpsStartSeconds!,
+        windowSeconds: result.durationSeconds ?? _windowSeconds() ?? 10.0,
+      );
+    }
+    _analysisDeck = [
+      for (final plot in result.plots)
+        AnalysisDeckEntry(
+          label: plot.label,
+          channelIds: [...plot.channels],
+          spec: {...plot.spec},
+        ),
+    ];
+    notifyListeners();
+    _scheduleSessionAutosave();
+
+    if (computeAll) {
+      final range = configuredReadWindowRange;
+      if (range == null) {
+        warnings.add('Compute all skipped — no GPS window is configured.');
+      } else {
+        await computeAllAnalysisDeck(range);
+      }
+    }
+    return warnings;
+  }
+
+  Future<List<String>> restoreLastSession({bool computeAll = false}) async {
+    final path = _sessionAutosavePath;
+    if (path == null) {
+      return ['No autosave location is available on this platform.'];
+    }
+    try {
+      final text = await io.File(path).readAsString();
+      final session = decodeWorkspaceSession(text);
+      _lastSessionAvailable = false;
+      return await restoreWorkspaceSession(session, computeAll: computeAll);
+    } on SessionFormatException catch (error) {
+      return ['Could not restore the last session: ${error.message}'];
+    } catch (error) {
+      return ['Could not restore the last session: $error'];
+    }
+  }
+
+  double? _windowSeconds() {
+    final range = configuredReadWindowRange;
+    if (range == null) {
+      return null;
+    }
+    return (range.endNs - range.startNs) / 1.0e9;
+  }
+
+  Future<void> _openSessionSources(
+    List<String> uris,
+    List<String> warnings,
+  ) async {
+    for (var index = 0; index < uris.length; index++) {
+      final uri = uris[index];
+      if (index > 0) {
+        warnings.add(
+          'Source `$uri` not reopened — the workspace keeps a single '
+          'active source.',
+        );
+        continue;
+      }
+      await openSource(uri);
+      if (_source?.uri != uri) {
+        final reason = _errorMessage == null ? '' : ': $_errorMessage';
+        warnings.add('Failed to open source `$uri`$reason');
+      }
+    }
+  }
+
+  void _scheduleSessionAutosave() {
+    if (_disposed) {
+      return;
+    }
+    _sessionAutosaveTimer?.cancel();
+    _sessionAutosaveTimer = Timer(
+      const Duration(seconds: 1),
+      _writeSessionAutosave,
+    );
+  }
+
+  Future<void> _writeSessionAutosave() async {
+    final path = _sessionAutosavePath;
+    if (path == null || _disposed) {
+      return;
+    }
+    try {
+      final file = io.File(path);
+      await file.parent.create(recursive: true);
+      await file.writeAsString(
+        encodeWorkspaceSession(buildWorkspaceSession()),
+      );
+    } catch (_) {
+      // Autosave is best-effort; never surface filesystem errors.
+    }
   }
 
   List<StreamDescriptor> _loadedCatalogStreams() {
@@ -449,10 +746,12 @@ class WorkspaceController extends ChangeNotifier {
       return;
     }
     _initialized = true;
-    await openSource(_defaultSourceUri);
+    // The automatic startup open must not clobber `last_session.json`
+    // before the user has had a chance to restore it.
+    await openSource(_defaultSourceUri, autosave: false);
   }
 
-  Future<void> openSource(String uri) async {
+  Future<void> openSource(String uri, {bool autosave = true}) async {
     final trimmedUri = uri.trim();
     if (trimmedUri.isEmpty) {
       _setError('Source URI must not be empty.');
@@ -494,6 +793,9 @@ class WorkspaceController extends ChangeNotifier {
         }
 
         await _refreshCatalog(autoSelectFirst: true);
+        if (autosave) {
+          _scheduleSessionAutosave();
+        }
       } on BackendException catch (error) {
         _setError(error.message);
       } catch (error) {
@@ -1488,6 +1790,7 @@ class WorkspaceController extends ChangeNotifier {
   void dispose() {
     _disposed = true;
     _dynamicPlaybackTimer?.cancel();
+    _sessionAutosaveTimer?.cancel();
     nativeLoadResult.backend?.dispose();
     super.dispose();
   }
@@ -1821,6 +2124,7 @@ class WorkspaceController extends ChangeNotifier {
       ),
     );
     _applyConfiguredWindowToDeck(clearSeries: true);
+    _scheduleSessionAutosave();
     notifyListeners();
   }
 
@@ -2211,6 +2515,9 @@ class _WorkspaceContent extends StatelessWidget {
                   WorkspaceSection.plots => _PlotsSection(
                     controller: controller,
                   ),
+                  WorkspaceSection.analysis => _AnalysisSection(
+                    controller: controller,
+                  ),
                   WorkspaceSection.backends => _BackendsSection(
                     controller: controller,
                     sourceUriController: sourceUriController,
@@ -2267,6 +2574,8 @@ class _TopBar extends StatelessWidget {
             WorkspaceSection.catalog =>
               'Browse channels and manage deck selection.',
             WorkspaceSection.plots => 'Dynamic multi-series deck.',
+            WorkspaceSection.analysis =>
+              'Engine-side DSP: FFT, spectrogram, coherence, transfer function, BRMS.',
             WorkspaceSection.backends =>
               'Open local sources and inspect runtime status.',
           },
@@ -2376,9 +2685,288 @@ class _SessionSection extends StatelessWidget {
           ],
         ),
         const SizedBox(height: 18),
+        _WorkspaceSessionPanel(controller: controller),
+        const SizedBox(height: 18),
         const _RoadmapPanel(),
       ],
     );
+  }
+}
+
+class _WorkspaceSessionPanel extends StatefulWidget {
+  const _WorkspaceSessionPanel({required this.controller});
+
+  final WorkspaceController controller;
+
+  @override
+  State<_WorkspaceSessionPanel> createState() => _WorkspaceSessionPanelState();
+}
+
+class _WorkspaceSessionPanelState extends State<_WorkspaceSessionPanel> {
+  bool _busy = false;
+  bool _computeAllAfterLoad = false;
+  String? _summary;
+  List<String> _warnings = const [];
+
+  @override
+  Widget build(BuildContext context) {
+    final controller = widget.controller;
+
+    return _Panel(
+      title: 'Workspace',
+      subtitle:
+          'Save or restore the session (sources, GPS window, analysis deck) '
+          'as versioned JSON, or import an original dataDisplay dy.cfg.',
+      expandChild: false,
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          if (controller.lastSessionAvailable) ...[
+            Container(
+              width: double.infinity,
+              padding: const EdgeInsets.symmetric(
+                horizontal: 14,
+                vertical: 10,
+              ),
+              decoration: BoxDecoration(
+                color: const Color(0xFFEAF3EE),
+                borderRadius: BorderRadius.circular(16),
+                border: Border.all(color: const Color(0xFFBFD6C8)),
+              ),
+              child: Wrap(
+                spacing: 12,
+                runSpacing: 8,
+                crossAxisAlignment: WrapCrossAlignment.center,
+                children: [
+                  const Text(
+                    'An autosaved session from the last run was found.',
+                    style: TextStyle(
+                      color: Color(0xFF2B4A3A),
+                      fontWeight: FontWeight.w600,
+                    ),
+                  ),
+                  FilledButton.tonalIcon(
+                    onPressed: _busy ? null : _restoreLastSession,
+                    icon: const Icon(Icons.history_rounded),
+                    label: const Text('Restore last session'),
+                  ),
+                ],
+              ),
+            ),
+            const SizedBox(height: 12),
+          ],
+          Wrap(
+            spacing: 10,
+            runSpacing: 10,
+            crossAxisAlignment: WrapCrossAlignment.center,
+            children: [
+              FilledButton.icon(
+                onPressed: _busy ? null : _saveSession,
+                icon: const Icon(Icons.save_rounded),
+                label: const Text('Save session…'),
+              ),
+              OutlinedButton.icon(
+                onPressed: _busy ? null : _loadSession,
+                icon: const Icon(Icons.folder_open_rounded),
+                label: const Text('Load session…'),
+              ),
+              OutlinedButton.icon(
+                onPressed: _busy ? null : _importDyConfig,
+                icon: const Icon(Icons.input_rounded),
+                label: const Text('Import dy.cfg…'),
+              ),
+              Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Checkbox(
+                    value: _computeAllAfterLoad,
+                    onChanged: _busy
+                        ? null
+                        : (value) {
+                            setState(
+                              () => _computeAllAfterLoad = value ?? false,
+                            );
+                          },
+                  ),
+                  const Text(
+                    'Compute all after load',
+                    style: TextStyle(fontWeight: FontWeight.w600),
+                  ),
+                ],
+              ),
+              if (_busy)
+                const SizedBox(
+                  width: 18,
+                  height: 18,
+                  child: CircularProgressIndicator(strokeWidth: 2),
+                ),
+            ],
+          ),
+          if (_summary != null) ...[
+            const SizedBox(height: 12),
+            SelectableText(
+              _summary!,
+              style: const TextStyle(
+                color: Color(0xFF2B4A3A),
+                fontWeight: FontWeight.w700,
+              ),
+            ),
+          ],
+          if (_warnings.isNotEmpty) ...[
+            const SizedBox(height: 8),
+            Container(
+              width: double.infinity,
+              constraints: const BoxConstraints(maxHeight: 200),
+              padding: const EdgeInsets.symmetric(
+                horizontal: 14,
+                vertical: 10,
+              ),
+              decoration: BoxDecoration(
+                color: const Color(0xFFFDF4E3),
+                borderRadius: BorderRadius.circular(16),
+                border: Border.all(color: const Color(0xFFE9D3A4)),
+              ),
+              child: SingleChildScrollView(
+                child: SelectableText(
+                  _warnings.map((warning) => '• $warning').join('\n'),
+                  style: const TextStyle(
+                    color: Color(0xFF6A4E12),
+                    fontSize: 12,
+                    fontWeight: FontWeight.w600,
+                    height: 1.5,
+                  ),
+                ),
+              ),
+            ),
+          ],
+        ],
+      ),
+    );
+  }
+
+  Future<void> _saveSession() async {
+    try {
+      final location = await fs.getSaveLocation(
+        suggestedName: 'workspace.ddsession.json',
+        acceptedTypeGroups: const [
+          fs.XTypeGroup(label: 'Session', extensions: ['json']),
+        ],
+      );
+      if (location == null) {
+        return;
+      }
+      final text = encodeWorkspaceSession(
+        widget.controller.buildWorkspaceSession(),
+      );
+      await io.File(location.path).writeAsString(text);
+      setState(() {
+        _summary = 'Session saved to ${location.path}';
+        _warnings = const [];
+      });
+    } catch (error) {
+      setState(() {
+        _summary = 'Save failed: $error';
+        _warnings = const [];
+      });
+    }
+  }
+
+  Future<void> _loadSession() async {
+    final file = await fs.openFile(
+      acceptedTypeGroups: const [
+        fs.XTypeGroup(label: 'Session', extensions: ['json']),
+      ],
+    );
+    if (file == null) {
+      return;
+    }
+
+    WorkspaceSession session;
+    try {
+      session = decodeWorkspaceSession(await file.readAsString());
+    } on SessionFormatException catch (error) {
+      setState(() {
+        _summary = 'Session not loaded: ${error.message}';
+        _warnings = const [];
+      });
+      return;
+    } catch (error) {
+      setState(() {
+        _summary = 'Session not loaded: $error';
+        _warnings = const [];
+      });
+      return;
+    }
+
+    setState(() => _busy = true);
+    final warnings = await widget.controller.restoreWorkspaceSession(
+      session,
+      computeAll: _computeAllAfterLoad,
+    );
+    if (!mounted) {
+      return;
+    }
+    setState(() {
+      _busy = false;
+      _summary =
+          'Session loaded: ${session.deck.length} deck '
+          'entr${session.deck.length == 1 ? 'y' : 'ies'}, '
+          '${session.sourceUris.length} source(s).';
+      _warnings = warnings;
+    });
+  }
+
+  Future<void> _importDyConfig() async {
+    final file = await fs.openFile(
+      acceptedTypeGroups: const [
+        fs.XTypeGroup(label: 'dataDisplay config', extensions: ['cfg']),
+      ],
+    );
+    if (file == null) {
+      return;
+    }
+
+    DyConfigImportResult result;
+    try {
+      result = parseDyConfig(await file.readAsString());
+    } catch (error) {
+      setState(() {
+        _summary = 'dy.cfg import failed: $error';
+        _warnings = const [];
+      });
+      return;
+    }
+
+    setState(() => _busy = true);
+    final warnings = await widget.controller.applyDyConfigImport(
+      result,
+      computeAll: _computeAllAfterLoad,
+    );
+    if (!mounted) {
+      return;
+    }
+    setState(() {
+      _busy = false;
+      _summary =
+          'dy.cfg imported: ${result.importedCount} plot(s) imported, '
+          '${result.skippedCount} skipped.';
+      _warnings = warnings;
+    });
+  }
+
+  Future<void> _restoreLastSession() async {
+    setState(() => _busy = true);
+    final warnings = await widget.controller.restoreLastSession(
+      computeAll: _computeAllAfterLoad,
+    );
+    if (!mounted) {
+      return;
+    }
+    setState(() {
+      _busy = false;
+      _summary = 'Last session restored.';
+      _warnings = warnings;
+    });
   }
 }
 
@@ -6535,3 +7123,875 @@ class _TomcatPanelState extends State<_TomcatPanel> {
     );
   }
 }
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Analysis section (engine-side DSP through dd_engine_plot_json)
+// ─────────────────────────────────────────────────────────────────────────────
+
+class _AnalysisSection extends StatefulWidget {
+  const _AnalysisSection({required this.controller});
+
+  final WorkspaceController controller;
+
+  @override
+  State<_AnalysisSection> createState() => _AnalysisSectionState();
+}
+
+class _AnalysisSectionState extends State<_AnalysisSection> {
+  AnalysisPlotKind _plotKind = AnalysisPlotKind.fft;
+  String? _channelA;
+  String? _channelB;
+  String _window = 'hann';
+  String _averaging = 'mean';
+  bool _removeDc = false;
+  bool _amplitude = true;
+  bool _db = false;
+  bool _rmsCurve = false;
+  bool _medianNormalize = false;
+  bool _sqrtCoherence = false;
+  bool _phaseAsDelay = false;
+  bool _logX = true;
+  bool _logY = true;
+  bool _logZ = true;
+  bool _computing = false;
+  PlotFigure? _figure;
+  String? _analysisError;
+
+  /// Bumped when deck entries are loaded back into the form so keyed
+  /// dropdowns rebuild with the restored initial selections.
+  int _formRevision = 0;
+
+  static const _gridOptions = [(1, 1), (2, 1), (2, 2), (3, 2), (3, 3)];
+
+  final TextEditingController _gpsStartController = TextEditingController();
+  final TextEditingController _durationController = TextEditingController();
+  final TextEditingController _segmentSecondsController =
+      TextEditingController(text: '1');
+  final TextEditingController _stepSecondsController = TextEditingController(
+    text: '0.5',
+  );
+  final TextEditingController _overlapController = TextEditingController(
+    text: '0.5',
+  );
+  final TextEditingController _maxSegmentsController = TextEditingController();
+  final TextEditingController _decayCountController = TextEditingController(
+    text: '8',
+  );
+  final TextEditingController _bandLowController = TextEditingController();
+  final TextEditingController _bandHighController = TextEditingController();
+  final TextEditingController _filterOrderController = TextEditingController(
+    text: '4',
+  );
+  final TextEditingController _resampleController = TextEditingController();
+  final TextEditingController _maxPointsController = TextEditingController();
+  final TextEditingController _fminController = TextEditingController();
+  final TextEditingController _fmaxController = TextEditingController();
+  final TextEditingController _brmsFminController = TextEditingController(
+    text: '1',
+  );
+  final TextEditingController _brmsFmaxController = TextEditingController(
+    text: '100',
+  );
+  final TextEditingController _yMinController = TextEditingController();
+  final TextEditingController _yMaxController = TextEditingController();
+  final TextEditingController _zMinController = TextEditingController();
+  final TextEditingController _zMaxController = TextEditingController();
+  final TextEditingController _averagesPerColumnController =
+      TextEditingController();
+  final TextEditingController _shiftBController = TextEditingController(
+    text: '0',
+  );
+
+  @override
+  void dispose() {
+    _gpsStartController.dispose();
+    _durationController.dispose();
+    _segmentSecondsController.dispose();
+    _stepSecondsController.dispose();
+    _overlapController.dispose();
+    _maxSegmentsController.dispose();
+    _decayCountController.dispose();
+    _bandLowController.dispose();
+    _bandHighController.dispose();
+    _filterOrderController.dispose();
+    _resampleController.dispose();
+    _maxPointsController.dispose();
+    _fminController.dispose();
+    _fmaxController.dispose();
+    _brmsFminController.dispose();
+    _brmsFmaxController.dispose();
+    _yMinController.dispose();
+    _yMaxController.dispose();
+    _zMinController.dispose();
+    _zMaxController.dispose();
+    _averagesPerColumnController.dispose();
+    _shiftBController.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final controller = widget.controller;
+    _prefillTimeRange(controller);
+    final scalarStreams = controller.streams
+        .where((stream) => stream.isScalarTimeseries)
+        .toList(growable: false);
+
+    return Column(
+      children: [
+        _Panel(
+          title: 'Analysis request',
+          subtitle:
+              'Pick channels from the open catalog, choose a plot type, then compute in the Rust engine.',
+          expandChild: false,
+          child: controller.source == null
+              ? const Text(
+                  'Open a source to run engine-side analysis plots.',
+                  style: TextStyle(
+                    color: Color(0xFF5C6963),
+                    fontWeight: FontWeight.w600,
+                  ),
+                )
+              : Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Wrap(
+                      spacing: 12,
+                      runSpacing: 12,
+                      children: [
+                        _channelPicker(
+                          key: ValueKey('channel-a-$_formRevision'),
+                          label: 'Channel A',
+                          streams: scalarStreams,
+                          selected: _channelA,
+                          allowNone: false,
+                          onSelected: (value) {
+                            setState(() => _channelA = value);
+                          },
+                        ),
+                        if (_plotKind.allowsSecondChannel)
+                          _channelPicker(
+                            key: ValueKey('channel-b-$_formRevision'),
+                            label: _plotKind.needsSecondChannel
+                                ? 'Channel B (required)'
+                                : 'Channel B (optional)',
+                            streams: scalarStreams,
+                            selected: _channelB,
+                            allowNone: true,
+                            onSelected: (value) {
+                              setState(
+                                () => _channelB =
+                                    value == null || value.isEmpty
+                                    ? null
+                                    : value,
+                              );
+                            },
+                          ),
+                      ],
+                    ),
+                    const SizedBox(height: 14),
+                    Wrap(
+                      spacing: 12,
+                      runSpacing: 12,
+                      children: [
+                        _optionPicker<AnalysisPlotKind>(
+                          key: ValueKey('plot-kind-$_formRevision'),
+                          label: 'Plot type',
+                          value: _plotKind,
+                          entries: [
+                            for (final kind in AnalysisPlotKind.values)
+                              DropdownMenuEntry(
+                                value: kind,
+                                label: kind.label,
+                              ),
+                          ],
+                          onSelected: _selectPlotKind,
+                        ),
+                        if (_plotKind.usesWindow)
+                          _optionPicker<String>(
+                            key: ValueKey('window-$_formRevision'),
+                            label: 'Window',
+                            value: _window,
+                            entries: const [
+                              DropdownMenuEntry(value: 'hann', label: 'Hann'),
+                              DropdownMenuEntry(
+                                value: 'hamming',
+                                label: 'Hamming',
+                              ),
+                              DropdownMenuEntry(
+                                value: 'blackman',
+                                label: 'Blackman',
+                              ),
+                              DropdownMenuEntry(
+                                value: 'rectangular',
+                                label: 'Rectangular',
+                              ),
+                            ],
+                            onSelected: (value) {
+                              setState(() => _window = value);
+                            },
+                          ),
+                        if (_plotKind.usesAveraging)
+                          _optionPicker<String>(
+                            key: ValueKey('averaging-$_formRevision'),
+                            label: 'Averaging',
+                            value: _averaging,
+                            entries: const [
+                              DropdownMenuEntry(value: 'mean', label: 'Mean'),
+                              DropdownMenuEntry(
+                                value: 'median',
+                                label: 'Median',
+                              ),
+                              DropdownMenuEntry(value: 'decay', label: 'Decay'),
+                            ],
+                            onSelected: (value) {
+                              setState(() => _averaging = value);
+                            },
+                          ),
+                      ],
+                    ),
+                    const SizedBox(height: 14),
+                    Wrap(
+                      spacing: 12,
+                      runSpacing: 12,
+                      children: [
+                        _numberField(_gpsStartController, 'GPS start (s)'),
+                        _numberField(_durationController, 'Duration (s)'),
+                        ..._parameterFields(),
+                      ],
+                    ),
+                    const SizedBox(height: 12),
+                    Wrap(
+                      spacing: 8,
+                      runSpacing: 8,
+                      children: _toggleChips(),
+                    ),
+                    const SizedBox(height: 14),
+                    Wrap(
+                      spacing: 10,
+                      runSpacing: 10,
+                      children: [
+                        FilledButton.icon(
+                          onPressed: _computing ? null : _compute,
+                          icon: _computing
+                              ? const SizedBox(
+                                  width: 16,
+                                  height: 16,
+                                  child: CircularProgressIndicator(
+                                    strokeWidth: 2,
+                                  ),
+                                )
+                              : const Icon(Icons.functions_rounded),
+                          label: Text(_computing ? 'Computing…' : 'Compute'),
+                        ),
+                        OutlinedButton.icon(
+                          onPressed: _addToDeck,
+                          icon: const Icon(Icons.library_add_rounded),
+                          label: const Text('Add to deck'),
+                        ),
+                      ],
+                    ),
+                  ],
+                ),
+        ),
+        if (_analysisError != null) ...[
+          const SizedBox(height: 18),
+          Container(
+            width: double.infinity,
+            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+            decoration: BoxDecoration(
+              color: const Color(0xFFFBE5E2),
+              borderRadius: BorderRadius.circular(16),
+              border: Border.all(color: const Color(0xFFE9B2AC)),
+            ),
+            child: SelectableText(
+              _analysisError!,
+              style: const TextStyle(
+                color: Color(0xFF6A241E),
+                fontWeight: FontWeight.w600,
+              ),
+            ),
+          ),
+        ],
+        if (_figure != null) ...[
+          const SizedBox(height: 18),
+          _Panel(
+            title: 'Result',
+            subtitle: _figure!.title,
+            expandChild: false,
+            child: Column(
+              children: [
+                for (final scene in _figure!.scenes) ...[
+                  SizedBox(
+                    width: double.infinity,
+                    height: scene.plotKind == 'heatmap2d' ? 380 : 320,
+                    child: ScenePlotView(scene: scene),
+                  ),
+                  if (scene != _figure!.scenes.last) const SizedBox(height: 14),
+                ],
+              ],
+            ),
+          ),
+        ],
+        const SizedBox(height: 18),
+        _deckPanel(controller),
+      ],
+    );
+  }
+
+  Widget _deckPanel(WorkspaceController controller) {
+    final deck = controller.analysisDeck;
+    final anyComputing = deck.any((entry) => entry.computing);
+    final gridKey =
+        '${controller.analysisGridColumns}x${controller.analysisGridRows}';
+
+    return _Panel(
+      title: 'Analysis deck',
+      subtitle:
+          'Saved plots render as pads in a grid. Compute all uses the shared GPS start and duration above.',
+      expandChild: false,
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Wrap(
+            spacing: 10,
+            runSpacing: 10,
+            crossAxisAlignment: WrapCrossAlignment.center,
+            children: [
+              SegmentedButton<String>(
+                showSelectedIcon: false,
+                style: const ButtonStyle(
+                  visualDensity: VisualDensity.compact,
+                ),
+                segments: [
+                  for (final (cols, rows) in _gridOptions)
+                    ButtonSegment(
+                      value: '${cols}x$rows',
+                      label: Text('$cols×$rows'),
+                    ),
+                ],
+                selected: {gridKey},
+                onSelectionChanged: (selection) {
+                  final parts = selection.first.split('x');
+                  widget.controller.setAnalysisGrid(
+                    int.parse(parts[0]),
+                    int.parse(parts[1]),
+                  );
+                },
+              ),
+              FilledButton.icon(
+                onPressed: deck.isEmpty || anyComputing ? null : _computeAll,
+                icon: const Icon(Icons.play_circle_fill_rounded),
+                label: const Text('Compute all'),
+              ),
+              _TagChip(label: '${deck.length} in deck'),
+            ],
+          ),
+          const SizedBox(height: 14),
+          AnalysisDeckGrid(
+            entries: deck,
+            columns: controller.analysisGridColumns,
+            rows: controller.analysisGridRows,
+            onRecompute: _recomputeEntry,
+            onEdit: _editEntry,
+            onMove: controller.moveAnalysisDeckEntry,
+            onRemove: controller.removeAnalysisDeckEntryAt,
+          ),
+        ],
+      ),
+    );
+  }
+
+  void _prefillTimeRange(WorkspaceController controller) {
+    if (_gpsStartController.text.isNotEmpty ||
+        _durationController.text.isNotEmpty) {
+      return;
+    }
+    final range =
+        controller.configuredReadWindowRange ?? controller.sourceTimeRange;
+    if (range == null) {
+      return;
+    }
+    _gpsStartController.text = _formatGpsSecondsInputFromNs(
+      range.startNs.toDouble(),
+    );
+    _durationController.text = _formatDurationSecondsInput(
+      range.endNs - range.startNs,
+    );
+  }
+
+  void _selectPlotKind(AnalysisPlotKind kind) {
+    setState(() {
+      _plotKind = kind;
+      _logX = kind.usesFrequencyAxis;
+      _logY = kind == AnalysisPlotKind.fft ||
+          kind == AnalysisPlotKind.transferFunction;
+    });
+  }
+
+  Widget _channelPicker({
+    required Key key,
+    required String label,
+    required List<StreamDescriptor> streams,
+    required String? selected,
+    required bool allowNone,
+    required ValueChanged<String?> onSelected,
+  }) {
+    final ids = streams.map((stream) => stream.channel.id).toList();
+    return DropdownMenu<String>(
+      key: key,
+      width: 340,
+      label: Text(label),
+      enableFilter: true,
+      requestFocusOnTap: true,
+      menuHeight: 320,
+      initialSelection: selected != null && ids.contains(selected)
+          ? selected
+          : (allowNone ? '' : null),
+      inputDecorationTheme: _analysisFieldDecorationTheme,
+      dropdownMenuEntries: [
+        if (allowNone) const DropdownMenuEntry(value: '', label: '— none —'),
+        for (final id in ids) DropdownMenuEntry(value: id, label: id),
+      ],
+      onSelected: onSelected,
+    );
+  }
+
+  Widget _optionPicker<T>({
+    required Key key,
+    required String label,
+    required T value,
+    required List<DropdownMenuEntry<T>> entries,
+    required ValueChanged<T> onSelected,
+  }) {
+    return DropdownMenu<T>(
+      key: key,
+      width: 220,
+      label: Text(label),
+      initialSelection: value,
+      inputDecorationTheme: _analysisFieldDecorationTheme,
+      dropdownMenuEntries: entries,
+      onSelected: (selected) {
+        if (selected != null) {
+          onSelected(selected);
+        }
+      },
+    );
+  }
+
+  Widget _numberField(TextEditingController controller, String label) {
+    return SizedBox(
+      width: 176,
+      child: TextField(
+        controller: controller,
+        decoration: InputDecoration(
+          labelText: label,
+          filled: true,
+          fillColor: const Color(0xFFF2F5F1),
+          border: OutlineInputBorder(
+            borderRadius: BorderRadius.circular(18),
+            borderSide: BorderSide.none,
+          ),
+        ),
+        keyboardType: const TextInputType.numberWithOptions(
+          decimal: true,
+          signed: true,
+        ),
+      ),
+    );
+  }
+
+  List<Widget> _parameterFields() {
+    switch (_plotKind) {
+      case AnalysisPlotKind.time:
+        return [
+          _numberField(_bandLowController, 'Band low (Hz)'),
+          _numberField(_bandHighController, 'Band high (Hz)'),
+          _numberField(_filterOrderController, 'Filter order'),
+          _numberField(_resampleController, 'Resample (Hz)'),
+          _numberField(_maxPointsController, 'Max points'),
+          _numberField(_yMinController, 'Y min (auto)'),
+          _numberField(_yMaxController, 'Y max (auto)'),
+        ];
+      case AnalysisPlotKind.fft:
+        return [
+          _numberField(_segmentSecondsController, 'FFT length (s)'),
+          _numberField(_overlapController, 'Overlap (0-1)'),
+          _numberField(_maxSegmentsController, 'Max segments'),
+          if (_averaging == 'decay')
+            _numberField(_decayCountController, 'Decay count'),
+          _numberField(_fminController, 'F min (Hz)'),
+          _numberField(_fmaxController, 'F max (Hz)'),
+          _numberField(_yMinController, 'Y min (auto)'),
+          _numberField(_yMaxController, 'Y max (auto)'),
+        ];
+      case AnalysisPlotKind.spectrogram:
+        return [
+          _numberField(_segmentSecondsController, 'FFT length (s)'),
+          _numberField(_stepSecondsController, 'Step (s)'),
+          _numberField(_averagesPerColumnController, 'Avg / column'),
+          _numberField(_fminController, 'F min (Hz)'),
+          _numberField(_fmaxController, 'F max (Hz)'),
+          _numberField(_zMinController, 'Z min (auto)'),
+          _numberField(_zMaxController, 'Z max (auto)'),
+        ];
+      case AnalysisPlotKind.coherence:
+      case AnalysisPlotKind.transferFunction:
+        return [
+          _numberField(_segmentSecondsController, 'FFT length (s)'),
+          _numberField(_overlapController, 'Overlap (0-1)'),
+          _numberField(_maxSegmentsController, 'Max segments'),
+          if (_averaging == 'decay')
+            _numberField(_decayCountController, 'Decay count'),
+          _numberField(_shiftBController, 'B shift (s)'),
+          _numberField(_fminController, 'F min (Hz)'),
+          _numberField(_fmaxController, 'F max (Hz)'),
+          _numberField(_yMinController, 'Y min (auto)'),
+          _numberField(_yMaxController, 'Y max (auto)'),
+        ];
+      case AnalysisPlotKind.brms:
+        return [
+          _numberField(_brmsFminController, 'F min (Hz)'),
+          _numberField(_brmsFmaxController, 'F max (Hz)'),
+          _numberField(_segmentSecondsController, 'FFT length (s)'),
+          _numberField(_stepSecondsController, 'Step (s)'),
+          _numberField(_yMinController, 'Y min (auto)'),
+          _numberField(_yMaxController, 'Y max (auto)'),
+        ];
+    }
+  }
+
+  List<Widget> _toggleChips() {
+    Widget chip(String label, bool value, ValueChanged<bool> onChanged) {
+      return FilterChip(
+        label: Text(label),
+        selected: value,
+        onSelected: onChanged,
+      );
+    }
+
+    void update(void Function() apply) {
+      setState(apply);
+    }
+
+    switch (_plotKind) {
+      case AnalysisPlotKind.time:
+        return [
+          chip('Remove DC', _removeDc, (v) => update(() => _removeDc = v)),
+          chip('Log Y', _logY, (v) => update(() => _logY = v)),
+        ];
+      case AnalysisPlotKind.fft:
+        return [
+          chip('Remove DC', _removeDc, (v) => update(() => _removeDc = v)),
+          chip('Amplitude (1/√Hz)', _amplitude, (v) {
+            update(() => _amplitude = v);
+          }),
+          chip('dB', _db, (v) => update(() => _db = v)),
+          chip('RMS curve', _rmsCurve, (v) => update(() => _rmsCurve = v)),
+          chip('Log X', _logX, (v) => update(() => _logX = v)),
+          chip('Log Y', _logY, (v) => update(() => _logY = v)),
+        ];
+      case AnalysisPlotKind.spectrogram:
+        return [
+          chip('Remove DC', _removeDc, (v) => update(() => _removeDc = v)),
+          chip('Amplitude', _amplitude, (v) => update(() => _amplitude = v)),
+          chip('Median normalize', _medianNormalize, (v) {
+            update(() => _medianNormalize = v);
+          }),
+          chip('Log Z', _logZ, (v) => update(() => _logZ = v)),
+        ];
+      case AnalysisPlotKind.coherence:
+        return [
+          chip('Remove DC', _removeDc, (v) => update(() => _removeDc = v)),
+          chip('sqrt(coherence)', _sqrtCoherence, (v) {
+            update(() => _sqrtCoherence = v);
+          }),
+          chip('Log X', _logX, (v) => update(() => _logX = v)),
+        ];
+      case AnalysisPlotKind.transferFunction:
+        return [
+          chip('Remove DC', _removeDc, (v) => update(() => _removeDc = v)),
+          chip('Phase as delay', _phaseAsDelay, (v) {
+            update(() => _phaseAsDelay = v);
+          }),
+          chip('Log X', _logX, (v) => update(() => _logX = v)),
+          chip('Log module', _logY, (v) => update(() => _logY = v)),
+        ];
+      case AnalysisPlotKind.brms:
+        return [
+          chip('Remove DC', _removeDc, (v) => update(() => _removeDc = v)),
+          chip('Log Y', _logY, (v) => update(() => _logY = v)),
+        ];
+    }
+  }
+
+  AnalysisSpecForm _currentForm() {
+    return AnalysisSpecForm(
+      kind: _plotKind,
+      segmentSeconds: _segmentSecondsController.text,
+      stepSeconds: _stepSecondsController.text,
+      overlap: _overlapController.text,
+      window: _window,
+      averaging: _averaging,
+      maxSegments: _maxSegmentsController.text,
+      decayCount: _decayCountController.text,
+      bandLow: _bandLowController.text,
+      bandHigh: _bandHighController.text,
+      filterOrder: _filterOrderController.text,
+      resampleHz: _resampleController.text,
+      maxPoints: _maxPointsController.text,
+      fmin: _fminController.text,
+      fmax: _fmaxController.text,
+      brmsFmin: _brmsFminController.text,
+      brmsFmax: _brmsFmaxController.text,
+      yMin: _yMinController.text,
+      yMax: _yMaxController.text,
+      zMin: _zMinController.text,
+      zMax: _zMaxController.text,
+      averagesPerColumn: _averagesPerColumnController.text,
+      shiftB: _shiftBController.text,
+      removeDc: _removeDc,
+      amplitude: _amplitude,
+      db: _db,
+      rmsCurve: _rmsCurve,
+      medianNormalize: _medianNormalize,
+      sqrtCoherence: _sqrtCoherence,
+      phaseAsDelay: _phaseAsDelay,
+      logX: _logX,
+      logY: _logY,
+      logZ: _logZ,
+    );
+  }
+
+  void _applyForm(AnalysisSpecForm form) {
+    _segmentSecondsController.text = form.segmentSeconds;
+    _stepSecondsController.text = form.stepSeconds;
+    _overlapController.text = form.overlap;
+    _maxSegmentsController.text = form.maxSegments;
+    _decayCountController.text = form.decayCount;
+    _bandLowController.text = form.bandLow;
+    _bandHighController.text = form.bandHigh;
+    _filterOrderController.text = form.filterOrder;
+    _resampleController.text = form.resampleHz;
+    _maxPointsController.text = form.maxPoints;
+    _fminController.text = form.fmin;
+    _fmaxController.text = form.fmax;
+    _brmsFminController.text = form.brmsFmin;
+    _brmsFmaxController.text = form.brmsFmax;
+    _yMinController.text = form.yMin;
+    _yMaxController.text = form.yMax;
+    _zMinController.text = form.zMin;
+    _zMaxController.text = form.zMax;
+    _averagesPerColumnController.text = form.averagesPerColumn;
+    _shiftBController.text = form.shiftB;
+    _window = form.window;
+    _averaging = form.averaging;
+    _removeDc = form.removeDc;
+    _amplitude = form.amplitude;
+    _db = form.db;
+    _rmsCurve = form.rmsCurve;
+    _medianNormalize = form.medianNormalize;
+    _sqrtCoherence = form.sqrtCoherence;
+    _phaseAsDelay = form.phaseAsDelay;
+    _logX = form.logX;
+    _logY = form.logY;
+    _logZ = form.logZ;
+  }
+
+  Map<String, Object?>? _buildSpec() {
+    try {
+      return _currentForm().build();
+    } on AnalysisSpecException catch (error) {
+      _fail(error.message);
+      return null;
+    }
+  }
+
+  List<String>? _validatedChannelIds() {
+    final channelA = _channelA;
+    if (channelA == null || channelA.isEmpty) {
+      _fail('Select channel A from the catalog.');
+      return null;
+    }
+    final channelB = _channelB;
+    if (_plotKind.needsSecondChannel &&
+        (channelB == null || channelB.isEmpty)) {
+      _fail('${_plotKind.label} needs exactly two channels.');
+      return null;
+    }
+    return [
+      channelA,
+      if (_plotKind.allowsSecondChannel &&
+          channelB != null &&
+          channelB.isNotEmpty)
+        channelB,
+    ];
+  }
+
+  TimeRange? _timeRangeFromFields({bool report = true}) {
+    final startSec = double.tryParse(_gpsStartController.text.trim());
+    final durationSec = double.tryParse(_durationController.text.trim());
+    if (startSec == null) {
+      if (report) {
+        _fail('GPS start must be a valid number in seconds.');
+      }
+      return null;
+    }
+    if (durationSec == null || !durationSec.isFinite || durationSec <= 0) {
+      if (report) {
+        _fail('Duration must be a positive number in seconds.');
+      }
+      return null;
+    }
+    final startNs = (startSec * 1.0e9).round();
+    return TimeRange(
+      startNs: startNs,
+      endNs: startNs + math.max<int>(1, (durationSec * 1.0e9).round()),
+    );
+  }
+
+  String _entryLabel(List<String> channelIds) {
+    switch (_plotKind) {
+      case AnalysisPlotKind.coherence:
+        return 'Coherence ${channelIds.join(' / ')}';
+      case AnalysisPlotKind.transferFunction:
+        return 'TF ${channelIds.join(' -> ')}';
+      default:
+        return '${_plotKind.label} ${channelIds.join(', ')}';
+    }
+  }
+
+  Future<void> _compute() async {
+    final controller = widget.controller;
+    final source = controller.source;
+    final backend = controller.activeBackend;
+    if (source == null || backend == null) {
+      _fail('Open a source before computing analysis plots.');
+      return;
+    }
+    final channelIds = _validatedChannelIds();
+    if (channelIds == null) {
+      return;
+    }
+    final timeRange = _timeRangeFromFields();
+    if (timeRange == null) {
+      return;
+    }
+    final spec = _buildSpec();
+    if (spec == null) {
+      return;
+    }
+
+    setState(() {
+      _computing = true;
+      _analysisError = null;
+    });
+    try {
+      final figure = await backend.plot(
+        channels: [
+          for (final id in channelIds)
+            PlotChannelRef(sourceId: source.sourceId, channelId: id),
+        ],
+        timeRange: timeRange,
+        spec: spec,
+      );
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _figure = figure;
+        _computing = false;
+      });
+    } on BackendException catch (error) {
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _analysisError = error.message;
+        _computing = false;
+      });
+    } catch (error) {
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _analysisError = 'Plot request failed: $error';
+        _computing = false;
+      });
+    }
+  }
+
+  Future<void> _addToDeck() async {
+    final channelIds = _validatedChannelIds();
+    if (channelIds == null) {
+      return;
+    }
+    final spec = _buildSpec();
+    if (spec == null) {
+      return;
+    }
+    final entry = AnalysisDeckEntry(
+      label: _entryLabel(channelIds),
+      channelIds: channelIds,
+      spec: spec,
+    );
+    widget.controller.addAnalysisDeckEntry(entry);
+    setState(() => _analysisError = null);
+    final timeRange = _timeRangeFromFields(report: false);
+    if (timeRange != null) {
+      await widget.controller.computeAnalysisDeckEntry(entry, timeRange);
+    }
+  }
+
+  Future<void> _computeAll() async {
+    final timeRange = _timeRangeFromFields();
+    if (timeRange == null) {
+      return;
+    }
+    setState(() => _analysisError = null);
+    await widget.controller.computeAllAnalysisDeck(timeRange);
+  }
+
+  Future<void> _recomputeEntry(int index) async {
+    final deck = widget.controller.analysisDeck;
+    if (index < 0 || index >= deck.length) {
+      return;
+    }
+    final timeRange = _timeRangeFromFields();
+    if (timeRange == null) {
+      return;
+    }
+    await widget.controller.computeAnalysisDeckEntry(deck[index], timeRange);
+  }
+
+  void _editEntry(int index) {
+    final deck = widget.controller.analysisDeck;
+    if (index < 0 || index >= deck.length) {
+      return;
+    }
+    final entry = deck[index];
+    final form = AnalysisSpecForm.fromSpec(entry.spec);
+    setState(() {
+      _plotKind = form.kind;
+      _channelA = entry.channelIds.isNotEmpty ? entry.channelIds.first : null;
+      _channelB = entry.channelIds.length > 1 ? entry.channelIds[1] : null;
+      _applyForm(form);
+      _analysisError = null;
+      _formRevision += 1;
+    });
+  }
+
+  void _fail(String message) {
+    setState(() => _analysisError = message);
+  }
+}
+
+const _analysisFieldDecorationTheme = InputDecorationTheme(
+  filled: true,
+  fillColor: Color(0xFFF2F5F1),
+  border: OutlineInputBorder(
+    borderRadius: BorderRadius.all(Radius.circular(18)),
+    borderSide: BorderSide.none,
+  ),
+);

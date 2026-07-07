@@ -6,6 +6,7 @@ import 'dart:isolate';
 import 'package:ffi/ffi.dart';
 
 import 'datadisplay_backend.dart';
+import 'plot_scene.dart';
 
 typedef _EngineNewNative = Pointer<Void> Function();
 typedef _EngineFreeNative = Void Function(Pointer<Void>);
@@ -128,6 +129,22 @@ class NativeDatadisplayBackend implements DatadisplayBackendClient {
     return DataBlock.fromJson(
       data['block'] as Map<String, dynamic>? ?? const {},
     );
+  }
+
+  @override
+  Future<PlotFigure> plot({
+    required List<PlotChannelRef> channels,
+    required TimeRange timeRange,
+    required Map<String, Object?> spec,
+    bool allowGaps = false,
+  }) async {
+    final data = await _invoke('plot', {
+      'channels': [for (final channel in channels) channel.toJson()],
+      'time_range': timeRange.toJson(),
+      'spec': spec,
+      'allow_gaps': allowGaps,
+    });
+    return PlotFigure.fromJson(data);
   }
 
   Future<int> subscribe({
@@ -305,6 +322,7 @@ class _NativeBindings {
     required this.closeSourceJson,
     required this.catalogJson,
     required this.readJson,
+    required this.plotJson,
     required this.subscribeJson,
     required this.pollSubscriptionJson,
     required this.unsubscribeJson,
@@ -317,6 +335,7 @@ class _NativeBindings {
   final _JsonCommandDart closeSourceJson;
   final _JsonCommandDart catalogJson;
   final _JsonCommandDart readJson;
+  final _JsonCommandDart plotJson;
   final _JsonCommandDart subscribeJson;
   final _JsonCommandDart pollSubscriptionJson;
   final _JsonCommandDart unsubscribeJson;
@@ -345,6 +364,9 @@ class _NativeBindings {
       ),
       readJson: library.lookupFunction<_JsonCommandNative, _JsonCommandDart>(
         'dd_engine_read_json',
+      ),
+      plotJson: library.lookupFunction<_JsonCommandNative, _JsonCommandDart>(
+        'dd_engine_plot_json',
       ),
       subscribeJson: library
           .lookupFunction<_JsonCommandNative, _JsonCommandDart>(
@@ -417,6 +439,15 @@ void _nativeWorkerMain(Map<String, Object?> init) {
           replyPort.send(
             _invokeNativeJson(
               bindings.readJson,
+              bindings.stringFree,
+              engineHandle,
+              request,
+            ),
+          );
+        case 'plot':
+          replyPort.send(
+            _invokeNativeJson(
+              bindings.plotJson,
               bindings.stringFree,
               engineHandle,
               request,

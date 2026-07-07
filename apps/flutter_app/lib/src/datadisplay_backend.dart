@@ -1,5 +1,7 @@
 import 'dart:math' as math;
 
+import 'plot_scene.dart';
+
 class BackendException implements Exception {
   BackendException(this.kind, this.message);
 
@@ -594,6 +596,17 @@ abstract class DatadisplayBackendClient {
     bool allowGaps = false,
   });
 
+  /// One-call plot pipeline: reads the channels, runs the DSP described by
+  /// `spec` (`{"kind": "time" | "fft" | "spectrogram" | "coherence" |
+  /// "transfer_function" | "brms", ...}`) in the engine, and returns
+  /// ready-to-draw scenes.
+  Future<PlotFigure> plot({
+    required List<PlotChannelRef> channels,
+    required TimeRange timeRange,
+    required Map<String, Object?> spec,
+    bool allowGaps = false,
+  });
+
   void dispose() {}
 }
 
@@ -760,6 +773,20 @@ class DemoDatadisplayBackend implements DatadisplayBackendClient {
           'Unknown demo channel `$channelId`.',
         );
     }
+  }
+
+  @override
+  Future<PlotFigure> plot({
+    required List<PlotChannelRef> channels,
+    required TimeRange timeRange,
+    required Map<String, Object?> spec,
+    bool allowGaps = false,
+  }) async {
+    throw BackendException(
+      'unsupported',
+      'The demo backend does not support the analysis plot pipeline. '
+          'Open a native source through dd-ffi instead.',
+    );
   }
 
   @override
