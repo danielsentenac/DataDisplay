@@ -18,8 +18,10 @@ import 'src/analysis_deck.dart';
 import 'src/analysis_spec.dart';
 import 'src/datadisplay_backend.dart';
 import 'src/dy_config_import.dart';
+import 'src/live_follow.dart';
 import 'src/native_datadisplay_backend.dart';
 import 'src/plot_scene.dart';
+import 'src/reference_plots.dart';
 import 'src/scene_plot_view.dart';
 import 'src/session_store.dart';
 import 'src/tomcat_live_poller.dart';
@@ -417,6 +419,7 @@ class WorkspaceController extends ChangeNotifier {
         ],
         timeRange: timeRange,
         spec: entry.spec,
+        expression: entry.expression,
       );
       entry.figure = figure;
     } on BackendException catch (error) {
@@ -434,6 +437,188 @@ class WorkspaceController extends ChangeNotifier {
   Future<void> computeAllAnalysisDeck(TimeRange timeRange) async {
     for (final entry in [..._analysisDeck]) {
       await computeAnalysisDeckEntry(entry, timeRange);
+    }
+  }
+
+  // ── Deck sync-zoom (view-level x viewports, shared per x unit) ────────────
+
+  final DeckXZoom _analysisXZoom = DeckXZoom();
+
+  DeckXZoom get analysisXZoom => _analysisXZoom;
+
+  void setAnalysisXZoom(String? unit, double xMin, double xMax) {
+    if (_analysisXZoom.setRange(unit, xMin, xMax)) {
+      notifyListeners();
+    }
+  }
+
+  void clearAnalysisXZoomUnits(Set<String?> units) {
+    for (final unit in units) {
+      _analysisXZoom.clear(unit);
+    }
+    notifyListeners();
+  }
+
+  void clearAllAnalysisXZooms() {
+    _analysisXZoom.clearAll();
+    notifyListeners();
+  }
+
+  // ── Reference plots ───────────────────────────────────────────────────────
+
+  List<LoadedReference> _references = const [];
+  bool _fitReferences = false;
+
+  List<LoadedReference> get references => _references;
+  bool get fitReferences => _fitReferences;
+
+  void setFitReferences(bool enabled) {
+    if (_fitReferences == enabled) {
+      return;
+    }
+    _fitReferences = enabled;
+    notifyListeners();
+  }
+
+  /// Loads a `.ddref.json` reference figure; returns a warning message on
+  /// failure, null on success.
+  Future<String?> loadReferenceFromFile(
+    String path, {
+    int? colorIndex,
+    bool visible = true,
+  }) async {
+    try {
+      final reference = decodeReferenceFigure(
+        await io.File(path).readAsString(),
+        filePath: path,
+      );
+      reference.colorIndex =
+          colorIndex ?? _references.length % referencePalette.length;
+      reference.visible = visible;
+      _references = [..._references, reference];
+      _scheduleSessionAutosave();
+      notifyListeners();
+      return null;
+    } on ReferenceFormatException catch (error) {
+      return 'Reference `$path` not loaded: ${error.message}';
+    } catch (error) {
+      return 'Reference `$path` not loaded: $error';
+    }
+  }
+
+  void removeReferenceAt(int index) {
+    if (index < 0 || index >= _references.length) {
+      return;
+    }
+    _references = [..._references]..removeAt(index);
+    _scheduleSessionAutosave();
+    notifyListeners();
+  }
+
+  void setReferenceColor(int index, int colorIndex) {
+    if (index < 0 || index >= _references.length) {
+      return;
+    }
+    _references[index].colorIndex = colorIndex;
+    _scheduleSessionAutosave();
+    notifyListeners();
+  }
+
+  void setReferenceVisible(int index, bool visible) {
+    if (index < 0 || index >= _references.length) {
+      return;
+    }
+    _references[index].visible = visible;
+    _scheduleSessionAutosave();
+    notifyListeners();
+  }
+
+  // ── Live deck refresh ─────────────────────────────────────────────────────
+
+  Timer? _liveDeckTimer;
+  bool _liveDeckEnabled = false;
+  int _liveDeckIntervalSeconds = 10;
+  bool _liveDeckFollowNow = true;
+  bool _liveDeckTickRunning = false;
+
+  bool get liveDeckEnabled => _liveDeckEnabled;
+  int get liveDeckIntervalSeconds => _liveDeckIntervalSeconds;
+  bool get liveDeckFollowNow => _liveDeckFollowNow;
+
+  void setLiveDeckEnabled(bool enabled) {
+    if (_liveDeckEnabled == enabled) {
+      return;
+    }
+    _liveDeckEnabled = enabled;
+    _liveDeckTimer?.cancel();
+    _liveDeckTimer = null;
+    if (enabled) {
+      _stopDynamicPlayback(notify: false);
+      _liveDeckTimer = Timer.periodic(
+        Duration(seconds: _liveDeckIntervalSeconds),
+        (_) => _liveDeckTick(),
+      );
+      _liveDeckTick();
+    }
+    _scheduleSessionAutosave();
+    notifyListeners();
+  }
+
+  void setLiveDeckInterval(int seconds) {
+    final clamped = math.max(1, seconds);
+    if (_liveDeckIntervalSeconds == clamped) {
+      return;
+    }
+    _liveDeckIntervalSeconds = clamped;
+    if (_liveDeckEnabled) {
+      _liveDeckTimer?.cancel();
+      _liveDeckTimer = Timer.periodic(
+        Duration(seconds: clamped),
+        (_) => _liveDeckTick(),
+      );
+    }
+    _scheduleSessionAutosave();
+    notifyListeners();
+  }
+
+  void setLiveDeckFollowNow(bool enabled) {
+    if (_liveDeckFollowNow == enabled) {
+      return;
+    }
+    _liveDeckFollowNow = enabled;
+    _scheduleSessionAutosave();
+    notifyListeners();
+  }
+
+  /// One live refresh: optionally slide the shared window to "now", then
+  /// recompute every deck entry. Overlapping ticks are skipped; per-entry
+  /// failures surface on the cells without stopping the loop.
+  Future<void> _liveDeckTick() async {
+    if (_disposed || _liveDeckTickRunning || _analysisDeck.isEmpty) {
+      return;
+    }
+    var range = configuredReadWindowRange;
+    if (range == null) {
+      return;
+    }
+    _liveDeckTickRunning = true;
+    try {
+      if (_liveDeckFollowNow) {
+        range = _clampReadTimeRange(
+          slideLiveWindow(
+            current: range,
+            gpsNowSeconds: gpsNowSeconds(DateTime.now().toUtc()),
+          ),
+        );
+        // Slide the shared window without the plot-deck reset side effects
+        // of applySelectedReadWindow.
+        _readTimeRange = range;
+        _scheduleSessionAutosave();
+        notifyListeners();
+      }
+      await computeAllAnalysisDeck(range);
+    } finally {
+      _liveDeckTickRunning = false;
     }
   }
 
@@ -462,8 +647,22 @@ class WorkspaceController extends ChangeNotifier {
             label: entry.label,
             channelIds: [...entry.channelIds],
             spec: {...entry.spec},
+            expression: entry.expression,
           ),
       ],
+      references: [
+        for (final reference in _references)
+          SessionReference(
+            path: reference.filePath,
+            colorIndex: reference.colorIndex,
+            visible: reference.visible,
+          ),
+      ],
+      live: SessionLiveConfig(
+        enabled: _liveDeckEnabled,
+        intervalSeconds: _liveDeckIntervalSeconds,
+        followNow: _liveDeckFollowNow,
+      ),
     );
   }
 
@@ -474,6 +673,8 @@ class WorkspaceController extends ChangeNotifier {
     bool computeAll = false,
   }) async {
     final warnings = <String>[];
+    // Pause any running live loop while the session is being swapped in.
+    setLiveDeckEnabled(false);
     await _openSessionSources(session.sourceUris, warnings);
 
     if (session.gpsStartSeconds != null && _source != null) {
@@ -489,8 +690,24 @@ class WorkspaceController extends ChangeNotifier {
           label: entry.label,
           channelIds: [...entry.channelIds],
           spec: {...entry.spec},
+          expression: entry.expression,
         ),
     ];
+
+    _references = const [];
+    for (final reference in session.references) {
+      final warning = await loadReferenceFromFile(
+        reference.path,
+        colorIndex: reference.colorIndex,
+        visible: reference.visible,
+      );
+      if (warning != null) {
+        warnings.add(warning);
+      }
+    }
+    setLiveDeckFollowNow(session.live.followNow);
+    setLiveDeckInterval(session.live.intervalSeconds);
+
     notifyListeners();
     _scheduleSessionAutosave();
 
@@ -502,6 +719,10 @@ class WorkspaceController extends ChangeNotifier {
         await computeAllAnalysisDeck(range);
       }
     }
+
+    // Enable live mode last so its first tick does not race the restore
+    // compute above.
+    setLiveDeckEnabled(session.live.enabled);
     return warnings;
   }
 
@@ -1791,6 +2012,7 @@ class WorkspaceController extends ChangeNotifier {
     _disposed = true;
     _dynamicPlaybackTimer?.cancel();
     _sessionAutosaveTimer?.cancel();
+    _liveDeckTimer?.cancel();
     nativeLoadResult.backend?.dispose();
     super.dispose();
   }
@@ -7142,6 +7364,8 @@ class _AnalysisSectionState extends State<_AnalysisSection> {
   AnalysisPlotKind _plotKind = AnalysisPlotKind.fft;
   String? _channelA;
   String? _channelB;
+  String? _channelC;
+  String? _channelD;
   String _window = 'hann';
   String _averaging = 'mean';
   bool _removeDc = false;
@@ -7202,6 +7426,22 @@ class _AnalysisSectionState extends State<_AnalysisSection> {
   final TextEditingController _shiftBController = TextEditingController(
     text: '0',
   );
+  final TextEditingController _binsController = TextEditingController(
+    text: '100',
+  );
+  final TextEditingController _xBinsController = TextEditingController(
+    text: '100',
+  );
+  final TextEditingController _yBinsController = TextEditingController(
+    text: '100',
+  );
+  final TextEditingController _xMinController = TextEditingController();
+  final TextEditingController _xMaxController = TextEditingController();
+  final TextEditingController _expressionController = TextEditingController();
+
+  bool get _expressionActive =>
+      _plotKind.supportsExpression &&
+      _expressionController.text.trim().isNotEmpty;
 
   @override
   void dispose() {
@@ -7227,6 +7467,12 @@ class _AnalysisSectionState extends State<_AnalysisSection> {
     _zMaxController.dispose();
     _averagesPerColumnController.dispose();
     _shiftBController.dispose();
+    _binsController.dispose();
+    _xBinsController.dispose();
+    _yBinsController.dispose();
+    _xMinController.dispose();
+    _xMaxController.dispose();
+    _expressionController.dispose();
     super.dispose();
   }
 
@@ -7270,7 +7516,8 @@ class _AnalysisSectionState extends State<_AnalysisSection> {
                             setState(() => _channelA = value);
                           },
                         ),
-                        if (_plotKind.allowsSecondChannel)
+                        if (_plotKind.allowsSecondChannel ||
+                            _expressionActive)
                           _channelPicker(
                             key: ValueKey('channel-b-$_formRevision'),
                             label: _plotKind.needsSecondChannel
@@ -7288,8 +7535,63 @@ class _AnalysisSectionState extends State<_AnalysisSection> {
                               );
                             },
                           ),
+                        if (_expressionActive) ...[
+                          _channelPicker(
+                            key: ValueKey('channel-c-$_formRevision'),
+                            label: 'Channel C (optional)',
+                            streams: scalarStreams,
+                            selected: _channelC,
+                            allowNone: true,
+                            onSelected: (value) {
+                              setState(
+                                () => _channelC =
+                                    value == null || value.isEmpty
+                                    ? null
+                                    : value,
+                              );
+                            },
+                          ),
+                          _channelPicker(
+                            key: ValueKey('channel-d-$_formRevision'),
+                            label: 'Channel D (optional)',
+                            streams: scalarStreams,
+                            selected: _channelD,
+                            allowNone: true,
+                            onSelected: (value) {
+                              setState(
+                                () => _channelD =
+                                    value == null || value.isEmpty
+                                    ? null
+                                    : value,
+                              );
+                            },
+                          ),
+                        ],
                       ],
                     ),
+                    if (_plotKind.supportsExpression) ...[
+                      const SizedBox(height: 14),
+                      SizedBox(
+                        width: 480,
+                        child: TextField(
+                          controller: _expressionController,
+                          decoration: InputDecoration(
+                            labelText: 'Combine channels',
+                            hintText: 'ch0 - 2*ch1 (optional)',
+                            helperText:
+                                'Maths over ch0..chN (the selected channels in order); result becomes the plotted series.',
+                            helperMaxLines: 2,
+                            filled: true,
+                            fillColor: const Color(0xFFF2F5F1),
+                            border: OutlineInputBorder(
+                              borderRadius: BorderRadius.circular(18),
+                              borderSide: BorderSide.none,
+                            ),
+                          ),
+                          onChanged: (_) => setState(() {}),
+                        ),
+                      ),
+                    ],
                     const SizedBox(height: 14),
                     Wrap(
                       spacing: 12,
@@ -7420,13 +7722,33 @@ class _AnalysisSectionState extends State<_AnalysisSection> {
             title: 'Result',
             subtitle: _figure!.title,
             expandChild: false,
+            trailing: OutlinedButton.icon(
+              onPressed: () => _saveFigureAsReference(_figure),
+              icon: const Icon(Icons.bookmark_add_rounded),
+              label: const Text('Save as reference…'),
+            ),
             child: Column(
               children: [
                 for (final scene in _figure!.scenes) ...[
                   SizedBox(
                     width: double.infinity,
                     height: scene.plotKind == 'heatmap2d' ? 380 : 320,
-                    child: ScenePlotView(scene: scene),
+                    child: ScenePlotView(
+                      scene: scene,
+                      references: compatibleReferenceTraces(
+                        controller.references,
+                        scene,
+                      ),
+                      fitReferences: controller.fitReferences,
+                      xViewport: controller.analysisXZoom.viewportFor(
+                        scene.xAxis.unit,
+                      ),
+                      onXZoom: (xMin, xMax) => controller.setAnalysisXZoom(
+                        scene.xAxis.unit,
+                        xMin,
+                        xMax,
+                      ),
+                    ),
                   ),
                   if (scene != _figure!.scenes.last) const SizedBox(height: 14),
                 ],
@@ -7436,6 +7758,8 @@ class _AnalysisSectionState extends State<_AnalysisSection> {
         ],
         const SizedBox(height: 18),
         _deckPanel(controller),
+        const SizedBox(height: 18),
+        _referencePanel(controller),
       ],
     );
   }
@@ -7485,6 +7809,55 @@ class _AnalysisSectionState extends State<_AnalysisSection> {
                 icon: const Icon(Icons.play_circle_fill_rounded),
                 label: const Text('Compute all'),
               ),
+              OutlinedButton.icon(
+                onPressed: controller.analysisXZoom.isNotEmpty
+                    ? controller.clearAllAnalysisXZooms
+                    : null,
+                icon: const Icon(Icons.zoom_out_map_rounded),
+                label: const Text('Unzoom all'),
+              ),
+              FilterChip(
+                label: const Text('Live'),
+                selected: controller.liveDeckEnabled,
+                onSelected: deck.isEmpty && !controller.liveDeckEnabled
+                    ? null
+                    : controller.setLiveDeckEnabled,
+              ),
+              DropdownMenu<int>(
+                key: ValueKey(
+                  'live-interval-${controller.liveDeckIntervalSeconds}',
+                ),
+                width: 140,
+                label: const Text('Refresh'),
+                initialSelection: controller.liveDeckIntervalSeconds,
+                inputDecorationTheme: _analysisFieldDecorationTheme,
+                dropdownMenuEntries: const [
+                  DropdownMenuEntry(value: 5, label: '5 s'),
+                  DropdownMenuEntry(value: 10, label: '10 s'),
+                  DropdownMenuEntry(value: 30, label: '30 s'),
+                  DropdownMenuEntry(value: 60, label: '60 s'),
+                ],
+                onSelected: (value) {
+                  if (value != null) {
+                    controller.setLiveDeckInterval(value);
+                  }
+                },
+              ),
+              Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Checkbox(
+                    value: controller.liveDeckFollowNow,
+                    onChanged: (value) {
+                      controller.setLiveDeckFollowNow(value ?? true);
+                    },
+                  ),
+                  const Text(
+                    'Follow now',
+                    style: TextStyle(fontWeight: FontWeight.w600),
+                  ),
+                ],
+              ),
               _TagChip(label: '${deck.length} in deck'),
             ],
           ),
@@ -7493,14 +7866,217 @@ class _AnalysisSectionState extends State<_AnalysisSection> {
             entries: deck,
             columns: controller.analysisGridColumns,
             rows: controller.analysisGridRows,
+            references: controller.references,
+            fitReferences: controller.fitReferences,
+            xZoom: controller.analysisXZoom,
+            onXZoom: controller.setAnalysisXZoom,
+            onUnzoomUnits: controller.clearAnalysisXZoomUnits,
             onRecompute: _recomputeEntry,
             onEdit: _editEntry,
             onMove: controller.moveAnalysisDeckEntry,
             onRemove: controller.removeAnalysisDeckEntryAt,
+            onSaveReference: (index) =>
+                _saveFigureAsReference(deck[index].figure),
           ),
         ],
       ),
     );
+  }
+
+  Widget _referencePanel(WorkspaceController controller) {
+    final references = controller.references;
+
+    return _Panel(
+      title: 'Reference plots',
+      subtitle:
+          'Frozen curves superposed (dashed) on every compatible plot with the same x-axis unit.',
+      expandChild: false,
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Wrap(
+            spacing: 10,
+            runSpacing: 10,
+            crossAxisAlignment: WrapCrossAlignment.center,
+            children: [
+              OutlinedButton.icon(
+                onPressed: _loadReference,
+                icon: const Icon(Icons.folder_open_rounded),
+                label: const Text('Load reference…'),
+              ),
+              FilterChip(
+                label: const Text('Fit references'),
+                selected: controller.fitReferences,
+                onSelected: controller.setFitReferences,
+              ),
+            ],
+          ),
+          if (references.isEmpty) ...[
+            const SizedBox(height: 12),
+            const Text(
+              'No references loaded. Compute a line plot and use "Save as reference…", then load it here.',
+              style: TextStyle(
+                color: Color(0xFF5C6963),
+                fontWeight: FontWeight.w600,
+              ),
+            ),
+          ],
+          for (var index = 0; index < references.length; index++) ...[
+            const SizedBox(height: 10),
+            Row(
+              children: [
+                IconButton(
+                  icon: Icon(
+                    references[index].visible
+                        ? Icons.visibility_rounded
+                        : Icons.visibility_off_rounded,
+                    size: 18,
+                  ),
+                  tooltip: references[index].visible ? 'Hide' : 'Show',
+                  color: const Color(0xFF51605A),
+                  visualDensity: VisualDensity.compact,
+                  onPressed: () => controller.setReferenceVisible(
+                    index,
+                    !references[index].visible,
+                  ),
+                ),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        references[index].title.isEmpty
+                            ? references[index].filePath
+                            : references[index].title,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: const TextStyle(fontWeight: FontWeight.w700),
+                      ),
+                      Text(
+                        references[index].filePath,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: const TextStyle(
+                          fontSize: 11,
+                          color: Color(0xFF6B7772),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+                const SizedBox(width: 8),
+                Wrap(
+                  spacing: 4,
+                  children: [
+                    for (
+                      var colorIndex = 0;
+                      colorIndex < referencePalette.length;
+                      colorIndex++
+                    )
+                      InkWell(
+                        borderRadius: BorderRadius.circular(9),
+                        onTap: () => controller.setReferenceColor(
+                          index,
+                          colorIndex,
+                        ),
+                        child: Container(
+                          width: 16,
+                          height: 16,
+                          decoration: BoxDecoration(
+                            shape: BoxShape.circle,
+                            color: referencePalette[colorIndex],
+                            border: Border.all(
+                              color:
+                                  colorIndex ==
+                                      references[index].colorIndex %
+                                          referencePalette.length
+                                  ? const Color(0xFF1F2925)
+                                  : Colors.transparent,
+                              width: 2,
+                            ),
+                          ),
+                        ),
+                      ),
+                  ],
+                ),
+                IconButton(
+                  icon: const Icon(Icons.close_rounded, size: 18),
+                  tooltip: 'Remove',
+                  color: const Color(0xFF51605A),
+                  visualDensity: VisualDensity.compact,
+                  onPressed: () => controller.removeReferenceAt(index),
+                ),
+              ],
+            ),
+          ],
+        ],
+      ),
+    );
+  }
+
+  Future<void> _loadReference() async {
+    final file = await fs.openFile(
+      acceptedTypeGroups: const [
+        fs.XTypeGroup(label: 'Reference plot', extensions: ['json']),
+      ],
+    );
+    if (file == null) {
+      return;
+    }
+    final warning = await widget.controller.loadReferenceFromFile(file.path);
+    if (!mounted) {
+      return;
+    }
+    if (warning != null) {
+      _fail(warning);
+    } else {
+      setState(() => _analysisError = null);
+    }
+  }
+
+  Future<void> _saveFigureAsReference(PlotFigure? figure) async {
+    if (figure == null) {
+      return;
+    }
+    final blocker = referenceSaveBlocker(figure.scenes);
+    if (blocker != null) {
+      _fail(blocker);
+      return;
+    }
+    final safeName = figure.title
+        .replaceAll(RegExp(r'[^A-Za-z0-9._-]+'), '_')
+        .replaceAll(RegExp(r'^_+|_+$'), '');
+    final location = await fs.getSaveLocation(
+      suggestedName:
+          '${safeName.isEmpty ? 'reference' : safeName}.ddref.json',
+      acceptedTypeGroups: const [
+        fs.XTypeGroup(label: 'Reference plot', extensions: ['json']),
+      ],
+    );
+    if (location == null) {
+      return;
+    }
+    try {
+      await io.File(location.path).writeAsString(
+        encodeReferenceFigure(
+          title: figure.title,
+          savedAt: DateTime.now().toUtc().toIso8601String(),
+          scenes: figure.scenes,
+        ),
+      );
+      if (!mounted) {
+        return;
+      }
+      setState(() => _analysisError = null);
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Reference saved to ${location.path}')),
+      );
+    } catch (error) {
+      if (!mounted) {
+        return;
+      }
+      _fail('Reference save failed: $error');
+    }
   }
 
   void _prefillTimeRange(WorkspaceController controller) {
@@ -7659,6 +8235,21 @@ class _AnalysisSectionState extends State<_AnalysisSection> {
           _numberField(_yMinController, 'Y min (auto)'),
           _numberField(_yMaxController, 'Y max (auto)'),
         ];
+      case AnalysisPlotKind.histogram:
+        return [
+          _numberField(_binsController, 'Bins'),
+          _numberField(_xMinController, 'X min (auto)'),
+          _numberField(_xMaxController, 'X max (auto)'),
+        ];
+      case AnalysisPlotKind.histogram2d:
+        return [
+          _numberField(_xBinsController, 'X bins'),
+          _numberField(_yBinsController, 'Y bins'),
+          _numberField(_xMinController, 'X min (auto)'),
+          _numberField(_xMaxController, 'X max (auto)'),
+          _numberField(_yMinController, 'Y min (auto)'),
+          _numberField(_yMaxController, 'Y max (auto)'),
+        ];
     }
   }
 
@@ -7723,6 +8314,14 @@ class _AnalysisSectionState extends State<_AnalysisSection> {
           chip('Remove DC', _removeDc, (v) => update(() => _removeDc = v)),
           chip('Log Y', _logY, (v) => update(() => _logY = v)),
         ];
+      case AnalysisPlotKind.histogram:
+        return [
+          chip('Log Y', _logY, (v) => update(() => _logY = v)),
+        ];
+      case AnalysisPlotKind.histogram2d:
+        return [
+          chip('Log Z', _logZ, (v) => update(() => _logZ = v)),
+        ];
     }
   }
 
@@ -7751,6 +8350,12 @@ class _AnalysisSectionState extends State<_AnalysisSection> {
       zMax: _zMaxController.text,
       averagesPerColumn: _averagesPerColumnController.text,
       shiftB: _shiftBController.text,
+      bins: _binsController.text,
+      xBins: _xBinsController.text,
+      yBins: _yBinsController.text,
+      xMin: _xMinController.text,
+      xMax: _xMaxController.text,
+      expression: _expressionController.text,
       removeDc: _removeDc,
       amplitude: _amplitude,
       db: _db,
@@ -7785,6 +8390,12 @@ class _AnalysisSectionState extends State<_AnalysisSection> {
     _zMaxController.text = form.zMax;
     _averagesPerColumnController.text = form.averagesPerColumn;
     _shiftBController.text = form.shiftB;
+    _binsController.text = form.bins;
+    _xBinsController.text = form.xBins;
+    _yBinsController.text = form.yBins;
+    _xMinController.text = form.xMin;
+    _xMaxController.text = form.xMax;
+    _expressionController.text = form.expression;
     _window = form.window;
     _averaging = form.averaging;
     _removeDc = form.removeDc;
@@ -7820,12 +8431,14 @@ class _AnalysisSectionState extends State<_AnalysisSection> {
       _fail('${_plotKind.label} needs exactly two channels.');
       return null;
     }
+    final allowExtra = _plotKind.allowsSecondChannel || _expressionActive;
     return [
       channelA,
-      if (_plotKind.allowsSecondChannel &&
-          channelB != null &&
-          channelB.isNotEmpty)
-        channelB,
+      if (allowExtra && channelB != null && channelB.isNotEmpty) channelB,
+      if (_expressionActive) ...[
+        if (_channelC != null && _channelC!.isNotEmpty) _channelC!,
+        if (_channelD != null && _channelD!.isNotEmpty) _channelD!,
+      ],
     ];
   }
 
@@ -7895,6 +8508,7 @@ class _AnalysisSectionState extends State<_AnalysisSection> {
         ],
         timeRange: timeRange,
         spec: spec,
+        expression: _currentForm().requestExpression,
       );
       if (!mounted) {
         return;
@@ -7935,6 +8549,7 @@ class _AnalysisSectionState extends State<_AnalysisSection> {
       label: _entryLabel(channelIds),
       channelIds: channelIds,
       spec: spec,
+      expression: _currentForm().requestExpression,
     );
     widget.controller.addAnalysisDeckEntry(entry);
     setState(() => _analysisError = null);
@@ -7976,7 +8591,10 @@ class _AnalysisSectionState extends State<_AnalysisSection> {
       _plotKind = form.kind;
       _channelA = entry.channelIds.isNotEmpty ? entry.channelIds.first : null;
       _channelB = entry.channelIds.length > 1 ? entry.channelIds[1] : null;
+      _channelC = entry.channelIds.length > 2 ? entry.channelIds[2] : null;
+      _channelD = entry.channelIds.length > 3 ? entry.channelIds[3] : null;
       _applyForm(form);
+      _expressionController.text = entry.expression ?? '';
       _analysisError = null;
       _formRevision += 1;
     });

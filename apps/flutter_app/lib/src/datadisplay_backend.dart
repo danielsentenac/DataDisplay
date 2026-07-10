@@ -598,12 +598,14 @@ abstract class DatadisplayBackendClient {
 
   /// One-call plot pipeline: reads the channels, runs the DSP described by
   /// `spec` (`{"kind": "time" | "fft" | "spectrogram" | "coherence" |
-  /// "transfer_function" | "brms", ...}`) in the engine, and returns
-  /// ready-to-draw scenes.
+  /// "transfer_function" | "brms" | "histogram" | "histogram2d", ...}`) in
+  /// the engine, and returns ready-to-draw scenes. `expression` is optional
+  /// channel maths over `ch0`..`chN` combining the channels into one series.
   Future<PlotFigure> plot({
     required List<PlotChannelRef> channels,
     required TimeRange timeRange,
     required Map<String, Object?> spec,
+    String? expression,
     bool allowGaps = false,
   });
 
@@ -780,6 +782,7 @@ class DemoDatadisplayBackend implements DatadisplayBackendClient {
     required List<PlotChannelRef> channels,
     required TimeRange timeRange,
     required Map<String, Object?> spec,
+    String? expression,
     bool allowGaps = false,
   }) async {
     throw BackendException(

@@ -13,6 +13,7 @@ class _FakePlotBackend implements DatadisplayBackendClient {
     required List<PlotChannelRef> channels,
     required TimeRange timeRange,
     required Map<String, Object?> spec,
+    String? expression,
     bool allowGaps = false,
   }) async {
     final title = '${spec['kind']} ${channels.first.channelId}';
@@ -186,5 +187,47 @@ void main() {
       find.text('coherence plot needs exactly 2 channel(s), got 1'),
       findsOneWidget,
     );
+  });
+
+  group('DeckXZoom', () {
+    test('shares viewports per normalized x unit', () {
+      final zoom = DeckXZoom();
+      expect(zoom.isEmpty, isTrue);
+
+      expect(zoom.setRange('Hz', 10.0, 100.0), isTrue);
+      // Same unit up to case/whitespace -> same shared viewport.
+      expect(zoom.viewportFor('Hz'), (10.0, 100.0));
+      expect(zoom.viewportFor(' hz '), (10.0, 100.0));
+      // A different unit is not affected.
+      expect(zoom.viewportFor('s'), isNull);
+      expect(zoom.viewportFor(null), isNull);
+
+      expect(zoom.setRange('s', 0.0, 2.0), isTrue);
+      expect(zoom.viewportFor('s'), (0.0, 2.0));
+      expect(zoom.isNotEmpty, isTrue);
+
+      zoom.clear('HZ');
+      expect(zoom.viewportFor('Hz'), isNull);
+      expect(zoom.viewportFor('s'), (0.0, 2.0));
+
+      zoom.clearAll();
+      expect(zoom.isEmpty, isTrue);
+    });
+
+    test('rejects degenerate or non-finite ranges', () {
+      final zoom = DeckXZoom();
+      expect(zoom.setRange('Hz', 5.0, 5.0), isFalse);
+      expect(zoom.setRange('Hz', 10.0, 1.0), isFalse);
+      expect(zoom.setRange('Hz', double.nan, 1.0), isFalse);
+      expect(zoom.setRange('Hz', 0.0, double.infinity), isFalse);
+      expect(zoom.isEmpty, isTrue);
+    });
+
+    test('null and empty units share one viewport', () {
+      final zoom = DeckXZoom();
+      zoom.setRange(null, 1.0, 2.0);
+      expect(zoom.viewportFor(''), (1.0, 2.0));
+      expect(zoom.viewportFor(null), (1.0, 2.0));
+    });
   });
 }

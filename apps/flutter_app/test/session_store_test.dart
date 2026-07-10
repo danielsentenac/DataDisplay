@@ -131,6 +131,76 @@ void main() {
     );
   });
 
+  test('round-trips the deck entry expression', () {
+    final session = WorkspaceSession(
+      sourceUris: const [],
+      gpsStartSeconds: null,
+      durationSeconds: null,
+      gridColumns: 2,
+      gridRows: 2,
+      deck: [
+        AnalysisDeckEntry(
+          label: 'FFT combined',
+          channelIds: ['chan.a', 'chan.b'],
+          spec: {'kind': 'fft', 'segment_duration_s': 1.0},
+          expression: 'ch0 - 2*ch1',
+        ),
+        AnalysisDeckEntry(
+          label: 'Time chan.a',
+          channelIds: ['chan.a'],
+          spec: {'kind': 'time'},
+        ),
+      ],
+    );
+
+    final restored = decodeWorkspaceSession(encodeWorkspaceSession(session));
+    expect(restored.deck[0].expression, 'ch0 - 2*ch1');
+    expect(restored.deck[1].expression, isNull);
+  });
+
+  test('round-trips reference and live-refresh state', () {
+    final session = WorkspaceSession(
+      sourceUris: const [],
+      gpsStartSeconds: null,
+      durationSeconds: null,
+      gridColumns: 2,
+      gridRows: 2,
+      deck: const [],
+      references: const [
+        SessionReference(
+          path: '/data/refs/darm.ddref.json',
+          colorIndex: 3,
+          visible: false,
+        ),
+      ],
+      live: const SessionLiveConfig(
+        enabled: true,
+        intervalSeconds: 30,
+        followNow: false,
+      ),
+    );
+
+    final restored = decodeWorkspaceSession(encodeWorkspaceSession(session));
+    expect(restored.references, hasLength(1));
+    expect(restored.references.single.path, '/data/refs/darm.ddref.json');
+    expect(restored.references.single.colorIndex, 3);
+    expect(restored.references.single.visible, isFalse);
+    expect(restored.live.enabled, isTrue);
+    expect(restored.live.intervalSeconds, 30);
+    expect(restored.live.followNow, isFalse);
+  });
+
+  test('old v1 sessions without references/live decode with defaults', () {
+    final session = decodeWorkspaceSession('''
+{"version": 1, "app": "datadisplay", "sources": [],
+ "grid": {"columns": 2, "rows": 2}, "deck": []}
+''');
+    expect(session.references, isEmpty);
+    expect(session.live.enabled, isFalse);
+    expect(session.live.intervalSeconds, 10);
+    expect(session.live.followNow, isTrue);
+  });
+
   test('derives the autosave path from the environment', () {
     expect(
       defaultSessionAutosavePath(

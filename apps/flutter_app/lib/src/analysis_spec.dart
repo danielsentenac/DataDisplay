@@ -12,7 +12,9 @@ enum AnalysisPlotKind {
   spectrogram('Spectrogram', 'spectrogram'),
   coherence('Coherence', 'coherence'),
   transferFunction('Transfer function', 'transfer_function'),
-  brms('BRMS', 'brms');
+  brms('BRMS', 'brms'),
+  histogram('1D distribution', 'histogram'),
+  histogram2d('2D distribution', 'histogram2d');
 
   const AnalysisPlotKind(this.label, this.wireKind);
 
@@ -21,23 +23,40 @@ enum AnalysisPlotKind {
 
   bool get needsSecondChannel =>
       this == AnalysisPlotKind.coherence ||
-      this == AnalysisPlotKind.transferFunction;
+      this == AnalysisPlotKind.transferFunction ||
+      this == AnalysisPlotKind.histogram2d;
 
   bool get allowsSecondChannel =>
       needsSecondChannel ||
       this == AnalysisPlotKind.time ||
       this == AnalysisPlotKind.fft ||
-      this == AnalysisPlotKind.brms;
+      this == AnalysisPlotKind.brms ||
+      this == AnalysisPlotKind.histogram;
 
-  bool get usesWindow => this != AnalysisPlotKind.time;
+  bool get usesWindow =>
+      this != AnalysisPlotKind.time &&
+      this != AnalysisPlotKind.histogram &&
+      this != AnalysisPlotKind.histogram2d;
 
-  bool get usesAveraging => this == AnalysisPlotKind.fft || needsSecondChannel;
+  bool get usesAveraging =>
+      this == AnalysisPlotKind.fft ||
+      this == AnalysisPlotKind.coherence ||
+      this == AnalysisPlotKind.transferFunction;
 
   bool get usesFrequencyAxis =>
-      this == AnalysisPlotKind.fft || needsSecondChannel;
+      this == AnalysisPlotKind.fft ||
+      this == AnalysisPlotKind.coherence ||
+      this == AnalysisPlotKind.transferFunction;
 
   bool get usesStep =>
       this == AnalysisPlotKind.spectrogram || this == AnalysisPlotKind.brms;
+
+  /// Channel maths (`ch0 - 2*ch1` ...) combine the request channels into a
+  /// single input series; the engine rejects it for two-channel plots.
+  bool get supportsExpression =>
+      this != AnalysisPlotKind.coherence &&
+      this != AnalysisPlotKind.transferFunction &&
+      this != AnalysisPlotKind.histogram2d;
 
   static AnalysisPlotKind fromWireKind(String value) {
     return values.firstWhere(
@@ -81,6 +100,12 @@ class AnalysisSpecForm {
     this.zMax = '',
     this.averagesPerColumn = '',
     this.shiftB = '0',
+    this.bins = '100',
+    this.xBins = '100',
+    this.yBins = '100',
+    this.xMin = '',
+    this.xMax = '',
+    this.expression = '',
     this.removeDc = false,
     this.amplitude = true,
     this.db = false,
@@ -122,6 +147,17 @@ class AnalysisSpecForm {
   final String zMax;
   final String averagesPerColumn;
   final String shiftB;
+
+  /// Distribution (histogram) parameters; empty ranges mean auto.
+  final String bins;
+  final String xBins;
+  final String yBins;
+  final String xMin;
+  final String xMax;
+
+  /// Optional request-level channel maths over `ch0`..`chN` ("Combine
+  /// channels"). Not part of the `spec` map — see [requestExpression].
+  final String expression;
 
   final bool removeDc;
   final bool amplitude;
@@ -233,7 +269,33 @@ class AnalysisSpecForm {
           ..._yRangeFields(),
           'log_y': logY,
         };
+      case AnalysisPlotKind.histogram:
+        return {
+          'kind': 'histogram',
+          'bins': _optionalInt(bins, 'Bins') ?? 100,
+          ..._xRangeFields(),
+          'log_y': logY,
+        };
+      case AnalysisPlotKind.histogram2d:
+        return {
+          'kind': 'histogram2d',
+          'x_bins': _optionalInt(xBins, 'X bins') ?? 100,
+          'y_bins': _optionalInt(yBins, 'Y bins') ?? 100,
+          ..._xRangeFields(),
+          ..._yRangeFields(),
+          'log_z': logZ,
+        };
     }
+  }
+
+  /// The request-level `expression` value, or null when empty or when the
+  /// plot kind does not accept channel maths.
+  String? get requestExpression {
+    final trimmed = expression.trim();
+    if (trimmed.isEmpty || !kind.supportsExpression) {
+      return null;
+    }
+    return trimmed;
   }
 
   /// Restores form values from a previously built spec map (deck editing).
@@ -269,6 +331,11 @@ class AnalysisSpecForm {
       zMax: _text(spec['z_max']),
       averagesPerColumn: _text(spec['averages_per_column']),
       shiftB: _text(spec['shift_b_s'], fallback: '0'),
+      bins: _text(spec['bins'], fallback: '100'),
+      xBins: _text(spec['x_bins'], fallback: '100'),
+      yBins: _text(spec['y_bins'], fallback: '100'),
+      xMin: _text(spec['x_min']),
+      xMax: _text(spec['x_max']),
       removeDc: spec['remove_dc'] as bool? ?? false,
       amplitude: spec['amplitude'] as bool? ?? true,
       db: spec['db'] as bool? ?? false,
@@ -282,6 +349,15 @@ class AnalysisSpecForm {
               kind == AnalysisPlotKind.transferFunction),
       logZ: spec['log_z'] as bool? ?? true,
     );
+  }
+
+  Map<String, Object?> _xRangeFields() {
+    final low = _optionalDouble(xMin, 'X min');
+    final high = _optionalDouble(xMax, 'X max');
+    if (low != null && high != null && high <= low) {
+      throw AnalysisSpecException('X range needs min < max.');
+    }
+    return {'x_min': ?low, 'x_max': ?high};
   }
 
   List<double>? _bandPair() {

@@ -3,6 +3,7 @@ import 'dart:math' as math;
 import 'package:flutter/material.dart';
 
 import 'plot_scene.dart';
+import 'reference_plots.dart';
 import 'scene_plot_view.dart';
 
 /// A saved analysis configuration plus its latest computed result.
@@ -14,15 +15,47 @@ class AnalysisDeckEntry {
     required this.label,
     required this.channelIds,
     required this.spec,
+    this.expression,
   });
 
   String label;
   List<String> channelIds;
   Map<String, Object?> spec;
 
+  /// Optional request-level channel maths (`ch0 - 2*ch1`), stored alongside
+  /// the spec like the channel ids.
+  String? expression;
+
   PlotFigure? figure;
   String? error;
   bool computing = false;
+}
+
+/// Shared x-axis zoom state for the deck: one viewport per x-axis unit so
+/// cells with the same unit (s, Hz, ...) zoom together. Pure view state —
+/// zooming never recomputes; drawing is clipped to the range.
+class DeckXZoom {
+  final Map<String, (double, double)> _byUnit = {};
+
+  static String _normalize(String? unit) => (unit ?? '').trim().toLowerCase();
+
+  (double, double)? viewportFor(String? unit) => _byUnit[_normalize(unit)];
+
+  /// Returns false (and stores nothing) for degenerate or non-finite ranges.
+  bool setRange(String? unit, double xMin, double xMax) {
+    if (!xMin.isFinite || !xMax.isFinite || xMax <= xMin) {
+      return false;
+    }
+    _byUnit[_normalize(unit)] = (xMin, xMax);
+    return true;
+  }
+
+  void clear(String? unit) => _byUnit.remove(_normalize(unit));
+
+  void clearAll() => _byUnit.clear();
+
+  bool get isEmpty => _byUnit.isEmpty;
+  bool get isNotEmpty => _byUnit.isNotEmpty;
 }
 
 /// The original tool's multi-pad canvas: deck entries laid out in a
@@ -34,21 +67,40 @@ class AnalysisDeckGrid extends StatelessWidget {
     required this.entries,
     required this.columns,
     required this.rows,
+    this.references = const [],
+    this.fitReferences = false,
+    this.xZoom,
     this.onRecompute,
     this.onEdit,
     this.onMove,
     this.onRemove,
+    this.onSaveReference,
+    this.onXZoom,
+    this.onUnzoomUnits,
   });
 
   final List<AnalysisDeckEntry> entries;
   final int columns;
   final int rows;
+
+  /// Loaded reference figures superposed on compatible cell scenes.
+  final List<LoadedReference> references;
+  final bool fitReferences;
+
+  /// Shared per-unit x zoom; cells whose scene x unit has a stored viewport
+  /// render zoomed, and brush selections report through [onXZoom].
+  final DeckXZoom? xZoom;
   final ValueChanged<int>? onRecompute;
   final ValueChanged<int>? onEdit;
 
   /// `onMove(index, delta)` with delta -1 (up) or +1 (down).
   final void Function(int index, int delta)? onMove;
   final ValueChanged<int>? onRemove;
+  final ValueChanged<int>? onSaveReference;
+  final void Function(String? unit, double xMin, double xMax)? onXZoom;
+
+  /// Per-cell unzoom: called with the x units of that cell's scenes.
+  final ValueChanged<Set<String?>>? onUnzoomUnits;
 
   double get _cellHeight {
     switch (rows) {
@@ -88,6 +140,11 @@ class AnalysisDeckGrid extends StatelessWidget {
       ),
       itemBuilder: (context, index) => _AnalysisDeckCell(
         entry: entries[index],
+        references: references,
+        fitReferences: fitReferences,
+        xZoom: xZoom,
+        onXZoom: onXZoom,
+        onUnzoomUnits: onUnzoomUnits,
         onRecompute: onRecompute == null ? null : () => onRecompute!(index),
         onEdit: onEdit == null ? null : () => onEdit!(index),
         onMoveUp: onMove == null || index == 0
@@ -97,6 +154,9 @@ class AnalysisDeckGrid extends StatelessWidget {
             ? null
             : () => onMove!(index, 1),
         onRemove: onRemove == null ? null : () => onRemove!(index),
+        onSaveReference: onSaveReference == null
+            ? null
+            : () => onSaveReference!(index),
       ),
     );
   }
@@ -105,19 +165,44 @@ class AnalysisDeckGrid extends StatelessWidget {
 class _AnalysisDeckCell extends StatelessWidget {
   const _AnalysisDeckCell({
     required this.entry,
+    required this.references,
+    required this.fitReferences,
+    required this.xZoom,
+    required this.onXZoom,
+    required this.onUnzoomUnits,
     required this.onRecompute,
     required this.onEdit,
     required this.onMoveUp,
     required this.onMoveDown,
     required this.onRemove,
+    required this.onSaveReference,
   });
 
   final AnalysisDeckEntry entry;
+  final List<LoadedReference> references;
+  final bool fitReferences;
+  final DeckXZoom? xZoom;
+  final void Function(String? unit, double xMin, double xMax)? onXZoom;
+  final ValueChanged<Set<String?>>? onUnzoomUnits;
   final VoidCallback? onRecompute;
   final VoidCallback? onEdit;
   final VoidCallback? onMoveUp;
   final VoidCallback? onMoveDown;
   final VoidCallback? onRemove;
+  final VoidCallback? onSaveReference;
+
+  Set<String?> get _sceneUnits => {
+    for (final scene in entry.figure?.scenes ?? const <PlotSceneData>[])
+      scene.xAxis.unit,
+  };
+
+  bool get _hasActiveZoom {
+    final zoom = xZoom;
+    if (zoom == null) {
+      return false;
+    }
+    return _sceneUnits.any((unit) => zoom.viewportFor(unit) != null);
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -158,6 +243,18 @@ class _AnalysisDeckCell extends StatelessWidget {
                 icon: Icons.refresh_rounded,
                 tooltip: 'Recompute',
                 onPressed: entry.computing ? null : onRecompute,
+              ),
+              _cellAction(
+                icon: Icons.bookmark_add_rounded,
+                tooltip: 'Save as reference',
+                onPressed: entry.figure == null ? null : onSaveReference,
+              ),
+              _cellAction(
+                icon: Icons.zoom_out_map_rounded,
+                tooltip: 'Unzoom',
+                onPressed: _hasActiveZoom && onUnzoomUnits != null
+                    ? () => onUnzoomUnits!(_sceneUnits)
+                    : null,
               ),
               _cellAction(
                 icon: Icons.edit_rounded,
@@ -219,7 +316,17 @@ class _AnalysisDeckCell extends StatelessWidget {
     return Column(
       children: [
         for (final scene in figure.scenes) ...[
-          Expanded(child: ScenePlotView(scene: scene)),
+          Expanded(
+            child: ScenePlotView(
+              scene: scene,
+              references: compatibleReferenceTraces(references, scene),
+              fitReferences: fitReferences,
+              xViewport: xZoom?.viewportFor(scene.xAxis.unit),
+              onXZoom: onXZoom == null
+                  ? null
+                  : (xMin, xMax) => onXZoom!(scene.xAxis.unit, xMin, xMax),
+            ),
+          ),
           if (scene != figure.scenes.last) const SizedBox(height: 8),
         ],
       ],

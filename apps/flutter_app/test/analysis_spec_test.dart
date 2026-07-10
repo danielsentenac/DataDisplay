@@ -259,5 +259,143 @@ void main() {
       expect(restored.fmin, '');
       expect(restored.fmax, '');
     });
+
+    test('restores histogram parameters', () {
+      final restored = AnalysisSpecForm.fromSpec(
+        AnalysisSpecForm(
+          kind: AnalysisPlotKind.histogram2d,
+          xBins: '64',
+          yBins: '32',
+          xMin: '-1',
+          xMax: '1',
+          yMin: '-2',
+          yMax: '2',
+          logZ: false,
+        ).build(),
+      );
+      expect(restored.kind, AnalysisPlotKind.histogram2d);
+      expect(restored.xBins, '64');
+      expect(restored.yBins, '32');
+      expect(restored.xMin, '-1');
+      expect(restored.xMax, '1');
+      expect(restored.yMin, '-2');
+      expect(restored.yMax, '2');
+      expect(restored.logZ, isFalse);
+      expect(restored.build(), contains('x_bins'));
+    });
+  });
+
+  group('distribution specs', () {
+    test('histogram spec emits bins, optional range and log flag', () {
+      final spec = AnalysisSpecForm(
+        kind: AnalysisPlotKind.histogram,
+        bins: '50',
+        xMin: '-3',
+        xMax: '3',
+        logY: true,
+      ).build();
+      expect(spec['kind'], 'histogram');
+      expect(spec['bins'], 50);
+      expect(spec['x_min'], -3.0);
+      expect(spec['x_max'], 3.0);
+      expect(spec['log_y'], true);
+
+      final minimal = AnalysisSpecForm(
+        kind: AnalysisPlotKind.histogram,
+        logY: false,
+      ).build();
+      expect(minimal['bins'], 100);
+      expect(minimal.containsKey('x_min'), isFalse);
+      expect(minimal.containsKey('x_max'), isFalse);
+      expect(minimal['log_y'], false);
+    });
+
+    test('histogram2d spec uses the no-underscore wire tag and both axes',
+        () {
+      final spec = AnalysisSpecForm(
+        kind: AnalysisPlotKind.histogram2d,
+        xBins: '80',
+        yBins: '60',
+        yMin: '0',
+        yMax: '10',
+      ).build();
+      expect(spec['kind'], 'histogram2d');
+      expect(spec['x_bins'], 80);
+      expect(spec['y_bins'], 60);
+      expect(spec.containsKey('x_min'), isFalse);
+      expect(spec['y_min'], 0.0);
+      expect(spec['y_max'], 10.0);
+      expect(spec['log_z'], true);
+
+      expect(
+        () => AnalysisSpecForm(
+          kind: AnalysisPlotKind.histogram2d,
+          xMin: '5',
+          xMax: '1',
+        ).build(),
+        throwsA(isA<AnalysisSpecException>()),
+      );
+    });
+  });
+
+  group('requestExpression', () {
+    test('emits the trimmed expression for supported kinds only', () {
+      expect(
+        AnalysisSpecForm(
+          kind: AnalysisPlotKind.fft,
+          expression: '  ch0 - 2*ch1 ',
+        ).requestExpression,
+        'ch0 - 2*ch1',
+      );
+      expect(
+        AnalysisSpecForm(
+          kind: AnalysisPlotKind.histogram,
+          expression: 'sqrt(ch0^2 + ch1^2)',
+        ).requestExpression,
+        'sqrt(ch0^2 + ch1^2)',
+      );
+      // Empty -> omitted.
+      expect(
+        AnalysisSpecForm(kind: AnalysisPlotKind.fft).requestExpression,
+        isNull,
+      );
+      expect(
+        AnalysisSpecForm(
+          kind: AnalysisPlotKind.time,
+          expression: '   ',
+        ).requestExpression,
+        isNull,
+      );
+      // Two-channel kinds never send an expression.
+      expect(
+        AnalysisSpecForm(
+          kind: AnalysisPlotKind.coherence,
+          expression: 'ch0 - ch1',
+        ).requestExpression,
+        isNull,
+      );
+      expect(
+        AnalysisSpecForm(
+          kind: AnalysisPlotKind.transferFunction,
+          expression: 'ch0',
+        ).requestExpression,
+        isNull,
+      );
+      expect(
+        AnalysisSpecForm(
+          kind: AnalysisPlotKind.histogram2d,
+          expression: 'ch0',
+        ).requestExpression,
+        isNull,
+      );
+    });
+
+    test('the expression never leaks into the spec map', () {
+      final spec = AnalysisSpecForm(
+        kind: AnalysisPlotKind.fft,
+        expression: 'ch0 - ch1',
+      ).build();
+      expect(spec.containsKey('expression'), isFalse);
+    });
   });
 }

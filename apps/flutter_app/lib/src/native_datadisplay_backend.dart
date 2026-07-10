@@ -136,12 +136,15 @@ class NativeDatadisplayBackend implements DatadisplayBackendClient {
     required List<PlotChannelRef> channels,
     required TimeRange timeRange,
     required Map<String, Object?> spec,
+    String? expression,
     bool allowGaps = false,
   }) async {
     final data = await _invoke('plot', {
       'channels': [for (final channel in channels) channel.toJson()],
       'time_range': timeRange.toJson(),
       'spec': spec,
+      if (expression != null && expression.isNotEmpty)
+        'expression': expression,
       'allow_gaps': allowGaps,
     });
     return PlotFigure.fromJson(data);

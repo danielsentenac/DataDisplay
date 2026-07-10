@@ -1,25 +1,173 @@
 import 'dart:math' as math;
 
+import 'package:flutter/foundation.dart' show listEquals;
 import 'package:flutter/material.dart';
 
 import 'plot_scene.dart';
+import 'reference_plots.dart';
 
 /// Renders one [PlotSceneData] returned by the engine plot pipeline.
 ///
 /// Supports `line1d` scenes (multi-trace polylines with linear/log axes) and
 /// `heatmap2d` scenes (positioned cells with a colorbar). Other kinds render
 /// a placeholder message.
-class ScenePlotView extends StatelessWidget {
-  const ScenePlotView({super.key, required this.scene});
+///
+/// `references` are pre-filtered compatible traces (see
+/// [compatibleReferenceTraces]) drawn dashed on top of line scenes. They do
+/// not rescale the viewport unless `fitReferences` is set.
+///
+/// Interaction: hovering shows a crosshair with per-trace readouts (nearest
+/// data x); tapping pins/unpins the cursor. When [onXZoom] is set, a
+/// horizontal drag selects an x range and reports it on release —
+/// [xViewport] then overrides the x axis (view-level only, no recompute).
+class ScenePlotView extends StatefulWidget {
+  const ScenePlotView({
+    super.key,
+    required this.scene,
+    this.references = const [],
+    this.fitReferences = false,
+    this.xViewport,
+    this.onXZoom,
+  });
 
   final PlotSceneData scene;
+  final List<ReferenceTrace> references;
+  final bool fitReferences;
+
+  /// View-level x-range override (zoom); drawing is clipped to it.
+  final (double, double)? xViewport;
+  final void Function(double xMin, double xMax)? onXZoom;
+
+  @override
+  State<ScenePlotView> createState() => _ScenePlotViewState();
+}
+
+class _ScenePlotViewState extends State<ScenePlotView> {
+  Offset? _hover;
+  Offset? _pinned;
+  double? _dragStartX;
+  double? _dragCurrentX;
+
+  bool get _interactive =>
+      widget.scene.plotKind == 'line1d' ||
+      (widget.scene.plotKind == 'heatmap2d' &&
+          widget.scene.firstHeatmapLayer != null);
 
   @override
   Widget build(BuildContext context) {
-    return CustomPaint(
-      painter: _ScenePlotPainter(scene: scene),
-      child: const SizedBox.expand(),
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final size = constraints.biggest;
+        final plotRect = _scenePlotRectFor(widget.scene, size);
+        final selection = _dragStartX != null && _dragCurrentX != null
+            ? (
+                math.min(_dragStartX!, _dragCurrentX!),
+                math.max(_dragStartX!, _dragCurrentX!),
+              )
+            : null;
+
+        return MouseRegion(
+          onHover: _interactive
+              ? (event) => setState(() => _hover = event.localPosition)
+              : null,
+          onExit: _interactive
+              ? (_) => setState(() => _hover = null)
+              : null,
+          child: GestureDetector(
+            behavior: HitTestBehavior.opaque,
+            onTapUp: _interactive
+                ? (details) => _handleTapUp(details, plotRect)
+                : null,
+            onHorizontalDragStart: widget.onXZoom != null && _interactive
+                ? (details) => _handleDragStart(details, plotRect)
+                : null,
+            onHorizontalDragUpdate: widget.onXZoom != null && _interactive
+                ? (details) => _handleDragUpdate(details, plotRect)
+                : null,
+            onHorizontalDragEnd: widget.onXZoom != null && _interactive
+                ? (_) => _handleDragEnd(plotRect)
+                : null,
+            onHorizontalDragCancel: widget.onXZoom != null && _interactive
+                ? _clearDrag
+                : null,
+            child: CustomPaint(
+              painter: _ScenePlotPainter(
+                scene: widget.scene,
+                references: widget.references,
+                fitReferences: widget.fitReferences,
+                xViewport: widget.xViewport,
+                cursor: _pinned ?? _hover,
+                cursorPinned: _pinned != null,
+                selectionX: selection,
+              ),
+              child: const SizedBox.expand(),
+            ),
+          ),
+        );
+      },
     );
+  }
+
+  void _handleTapUp(TapUpDetails details, Rect plotRect) {
+    setState(() {
+      if (_pinned != null) {
+        _pinned = null;
+      } else if (plotRect.contains(details.localPosition)) {
+        _pinned = details.localPosition;
+      }
+    });
+  }
+
+  void _handleDragStart(DragStartDetails details, Rect plotRect) {
+    if (!plotRect.contains(details.localPosition)) {
+      return;
+    }
+    setState(() {
+      _dragStartX = details.localPosition.dx;
+      _dragCurrentX = details.localPosition.dx;
+    });
+  }
+
+  void _handleDragUpdate(DragUpdateDetails details, Rect plotRect) {
+    if (_dragStartX == null) {
+      return;
+    }
+    setState(() {
+      _dragCurrentX = details.localPosition.dx.clamp(
+        plotRect.left,
+        plotRect.right,
+      );
+    });
+  }
+
+  void _handleDragEnd(Rect plotRect) {
+    final startX = _dragStartX;
+    final endX = _dragCurrentX;
+    if (startX != null && endX != null && (endX - startX).abs() > 6) {
+      final xScale = _sceneXScaleFor(
+        scene: widget.scene,
+        references: widget.references,
+        fitReferences: widget.fitReferences,
+        xViewport: widget.xViewport,
+      );
+      final lowFrac =
+          (math.min(startX, endX) - plotRect.left) / plotRect.width;
+      final highFrac =
+          (math.max(startX, endX) - plotRect.left) / plotRect.width;
+      final xMin = xScale.invert(lowFrac.clamp(0.0, 1.0));
+      final xMax = xScale.invert(highFrac.clamp(0.0, 1.0));
+      if (xMax > xMin) {
+        widget.onXZoom!(xMin, xMax);
+      }
+    }
+    _clearDrag();
+  }
+
+  void _clearDrag() {
+    setState(() {
+      _dragStartX = null;
+      _dragCurrentX = null;
+    });
   }
 }
 
@@ -95,6 +243,16 @@ class _AxisScale {
     }
     return (value - min) / math.max(1e-300, max - min);
   }
+
+  /// Inverse of [fraction]: data value at a 0..1 axis position.
+  double invert(double fraction) {
+    if (log) {
+      return math
+          .pow(10.0, _logMin + fraction * (_logMax - _logMin))
+          .toDouble();
+    }
+    return min + fraction * (max - min);
+  }
 }
 
 class _AxisTick {
@@ -105,12 +263,27 @@ class _AxisTick {
 }
 
 class _ScenePlotPainter extends CustomPainter {
-  _ScenePlotPainter({required this.scene});
+  _ScenePlotPainter({
+    required this.scene,
+    this.references = const [],
+    this.fitReferences = false,
+    this.xViewport,
+    this.cursor,
+    this.cursorPinned = false,
+    this.selectionX,
+  });
 
   final PlotSceneData scene;
+  final List<ReferenceTrace> references;
+  final bool fitReferences;
+  final (double, double)? xViewport;
 
-  static const _colorbarGap = 14.0;
-  static const _colorbarWidth = 12.0;
+  /// Cursor position (local coordinates) for the crosshair/readout.
+  final Offset? cursor;
+  final bool cursorPinned;
+
+  /// Active brush-zoom selection as (leftPx, rightPx).
+  final (double, double)? selectionX;
 
   @override
   void paint(Canvas canvas, Size size) {
@@ -132,45 +305,67 @@ class _ScenePlotPainter extends CustomPainter {
 
     final isHeatmap =
         scene.plotKind == 'heatmap2d' && scene.firstHeatmapLayer != null;
-    final rightInset = isHeatmap
-        ? _colorbarGap + _colorbarWidth + 58.0
-        : 22.0;
-    final plotRect = Rect.fromLTRB(
-      78,
-      40,
-      size.width - rightInset,
-      size.height - 46,
-    );
+    final plotRect = _scenePlotRectFor(scene, size);
     if (plotRect.width <= 8 || plotRect.height <= 8) {
       return;
     }
 
     if (isHeatmap) {
       _paintHeatmapScene(canvas, size, plotRect, scene.firstHeatmapLayer!);
-      return;
-    }
-    if (scene.plotKind == 'line1d') {
+    } else if (scene.plotKind == 'line1d') {
       _paintLineScene(canvas, size, plotRect);
+    } else {
+      _paintText(
+        canvas,
+        'Plot kind `${scene.plotKind}` is not supported yet.',
+        _sceneMessageStyle,
+        Offset(plotRect.left, plotRect.center.dy),
+      );
       return;
     }
-    _paintText(
-      canvas,
-      'Plot kind `${scene.plotKind}` is not supported yet.',
-      _sceneMessageStyle,
-      Offset(plotRect.left, plotRect.center.dy),
-    );
+
+    _paintSelection(canvas, plotRect);
   }
 
   @override
   bool shouldRepaint(covariant _ScenePlotPainter oldDelegate) {
-    return oldDelegate.scene != scene;
+    return oldDelegate.scene != scene ||
+        oldDelegate.fitReferences != fitReferences ||
+        oldDelegate.xViewport != xViewport ||
+        oldDelegate.cursor != cursor ||
+        oldDelegate.cursorPinned != cursorPinned ||
+        oldDelegate.selectionX != selectionX ||
+        !listEquals(oldDelegate.references, references);
+  }
+
+  void _paintSelection(Canvas canvas, Rect plotRect) {
+    final selection = selectionX;
+    if (selection == null || selection.$2 - selection.$1 < 1) {
+      return;
+    }
+    final rect = Rect.fromLTRB(
+      selection.$1.clamp(plotRect.left, plotRect.right),
+      plotRect.top,
+      selection.$2.clamp(plotRect.left, plotRect.right),
+      plotRect.bottom,
+    );
+    canvas.drawRect(rect, Paint()..color = const Color(0x2E0A7B6C));
+    canvas.drawRect(
+      rect,
+      Paint()
+        ..color = const Color(0xFF0A7B6C)
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = 1,
+    );
   }
 
   // ── line1d ────────────────────────────────────────────────────────────────
 
   void _paintLineScene(Canvas canvas, Size size, Rect plotRect) {
     final lines = scene.lineLayers.toList();
-    if (lines.isEmpty || lines.every((layer) => layer.xs.isEmpty)) {
+    final hasLineData =
+        lines.isNotEmpty && lines.any((layer) => layer.xs.isNotEmpty);
+    if (!hasLineData && references.isEmpty) {
       _paintPlotFrame(canvas, plotRect);
       _paintText(
         canvas,
@@ -181,15 +376,24 @@ class _ScenePlotPainter extends CustomPainter {
       return;
     }
 
-    final xScale = _scaleForAxis(
-      scene.xAxis,
-      () => _lineExtent(lines, (layer) => layer.xs, positiveOnly: false),
-      () => _lineExtent(lines, (layer) => layer.xs, positiveOnly: true),
+    // References never rescale the viewport unless "fit references" is on
+    // (or the scene itself has no data to define one).
+    final includeReferences = fitReferences || !hasLineData;
+    final ysLists = [
+      for (final layer in lines) layer.ys,
+      if (includeReferences) for (final trace in references) trace.ys,
+    ];
+
+    final xScale = _sceneXScaleFor(
+      scene: scene,
+      references: references,
+      fitReferences: fitReferences,
+      xViewport: xViewport,
     );
     final yScale = _scaleForAxis(
       scene.yAxis,
-      () => _lineExtent(lines, (layer) => layer.ys, positiveOnly: false),
-      () => _lineExtent(lines, (layer) => layer.ys, positiveOnly: true),
+      () => _valuesExtentOf(ysLists, positiveOnly: false),
+      () => _valuesExtentOf(ysLists, positiveOnly: true),
     );
 
     _paintPlotFrame(canvas, plotRect);
@@ -206,56 +410,225 @@ class _ScenePlotPainter extends CustomPainter {
         ..style = PaintingStyle.stroke
         ..strokeWidth = 1.8
         ..strokeCap = StrokeCap.round;
-      final path = Path();
-      var open = false;
-      final count = math.min(layer.xs.length, layer.ys.length);
-      for (var index = 0; index < count; index++) {
-        final fx = xScale.fraction(layer.xs[index]);
-        final fy = yScale.fraction(layer.ys[index]);
-        if (fx.isNaN || fy.isNaN) {
-          open = false;
-          continue;
-        }
-        final point = Offset(
-          plotRect.left + fx * plotRect.width,
-          plotRect.bottom - fy * plotRect.height,
-        );
-        if (open) {
-          path.lineTo(point.dx, point.dy);
-        } else {
-          path.moveTo(point.dx, point.dy);
-          open = true;
-        }
-      }
-      canvas.drawPath(path, linePaint);
+      canvas.drawPath(
+        _polylinePath(layer.xs, layer.ys, xScale, yScale, plotRect),
+        linePaint,
+      );
+    }
+    for (final trace in references) {
+      final referencePaint = Paint()
+        ..color = trace.color
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = 1.6
+        ..strokeCap = StrokeCap.round;
+      canvas.drawPath(
+        _dashPath(
+          _polylinePath(trace.xs, trace.ys, xScale, yScale, plotRect),
+        ),
+        referencePaint,
+      );
     }
     canvas.restore();
 
-    if (lines.length > 1) {
-      _paintLegend(canvas, plotRect, lines);
+    final legendEntries = <(String, Color, bool)>[
+      for (final layer in lines) (layer.label, _layerColor(layer), false),
+      for (final trace in references) (trace.label, trace.color, true),
+    ];
+    if (legendEntries.length > 1) {
+      _paintLegend(canvas, plotRect, legendEntries);
+    }
+
+    _paintLineCursor(canvas, plotRect, lines, xScale, yScale);
+  }
+
+  void _paintLineCursor(
+    Canvas canvas,
+    Rect plotRect,
+    List<LinePlotLayer> lines,
+    _AxisScale xScale,
+    _AxisScale yScale,
+  ) {
+    final position = cursor;
+    if (position == null || !plotRect.contains(position)) {
+      return;
+    }
+    final dataX = xScale.invert(
+      (position.dx - plotRect.left) / plotRect.width,
+    );
+
+    final rows = <(Color, String)>[];
+    double? anchorPx;
+    void sample(List<double> xs, List<double> ys, Color color) {
+      final index = nearestIndexForX(xs, dataX);
+      if (index < 0 || index >= ys.length) {
+        return;
+      }
+      rows.add((color, formatReadoutValue(ys[index])));
+      final fx = xScale.fraction(xs[index]);
+      final fy = yScale.fraction(ys[index]);
+      if (fx.isNaN || fy.isNaN) {
+        return;
+      }
+      final point = Offset(
+        plotRect.left + fx * plotRect.width,
+        plotRect.bottom - fy * plotRect.height,
+      );
+      anchorPx ??= point.dx;
+      if (plotRect.inflate(1).contains(point)) {
+        canvas.drawCircle(point, 3, Paint()..color = color);
+      }
+    }
+
+    for (final layer in lines) {
+      sample(layer.xs, layer.ys, _layerColor(layer));
+    }
+    for (final trace in references) {
+      sample(trace.xs, trace.ys, trace.color);
+    }
+
+    _paintCrosshair(canvas, plotRect, anchorPx ?? position.dx, position.dy);
+    _paintReadout(canvas, plotRect, position, [
+      'x: ${formatReadoutValue(dataX)}'
+          '${scene.xAxis.unit == null ? '' : ' ${scene.xAxis.unit}'}',
+    ], rows);
+  }
+
+  void _paintCrosshair(Canvas canvas, Rect plotRect, double x, double y) {
+    final crosshairPaint = Paint()
+      ..color = cursorPinned ? const Color(0xCC445C54) : const Color(0x77445C54)
+      ..strokeWidth = 1;
+    canvas.drawLine(
+      Offset(x, plotRect.top),
+      Offset(x, plotRect.bottom),
+      crosshairPaint,
+    );
+    canvas.drawLine(
+      Offset(plotRect.left, y),
+      Offset(plotRect.right, y),
+      crosshairPaint,
+    );
+  }
+
+  void _paintReadout(
+    Canvas canvas,
+    Rect plotRect,
+    Offset position,
+    List<String> headerLines,
+    List<(Color, String)> rows,
+  ) {
+    const rowHeight = 15.0;
+    const padding = 8.0;
+    const swatchSize = 8.0;
+
+    final headerPainters = <TextPainter>[];
+    final rowPainters = <TextPainter>[];
+    var maxWidth = 0.0;
+    TextPainter layoutText(String text) {
+      final painter = TextPainter(
+        text: TextSpan(text: text, style: _sceneLegendStyle),
+        textDirection: TextDirection.ltr,
+        maxLines: 1,
+        ellipsis: '…',
+      )..layout(maxWidth: 220);
+      return painter;
+    }
+
+    for (final line in headerLines) {
+      final painter = layoutText(line);
+      headerPainters.add(painter);
+      maxWidth = math.max(maxWidth, painter.width);
+    }
+    for (final (_, text) in rows) {
+      final painter = layoutText(text);
+      rowPainters.add(painter);
+      maxWidth = math.max(maxWidth, painter.width + swatchSize + 6);
+    }
+
+    final boxWidth = maxWidth + padding * 2;
+    final boxHeight =
+        padding * 2 + rowHeight * (headerPainters.length + rowPainters.length);
+    var left = position.dx + 14;
+    if (left + boxWidth > plotRect.right) {
+      left = position.dx - 14 - boxWidth;
+    }
+    var top = position.dy + 12;
+    if (top + boxHeight > plotRect.bottom) {
+      top = math.max(plotRect.top, position.dy - 12 - boxHeight);
+    }
+    final box = Rect.fromLTWH(left, top, boxWidth, boxHeight);
+
+    canvas.drawRRect(
+      RRect.fromRectAndRadius(box, const Radius.circular(8)),
+      Paint()..color = const Color(0xF2FFFFFF),
+    );
+    canvas.drawRRect(
+      RRect.fromRectAndRadius(box, const Radius.circular(8)),
+      Paint()
+        ..color = const Color(0xFFB9C6BF)
+        ..style = PaintingStyle.stroke,
+    );
+
+    var rowTop = box.top + padding;
+    for (final painter in headerPainters) {
+      painter.paint(canvas, Offset(box.left + padding, rowTop));
+      rowTop += rowHeight;
+    }
+    for (var index = 0; index < rowPainters.length; index++) {
+      final (color, _) = rows[index];
+      canvas.drawRect(
+        Rect.fromLTWH(box.left + padding, rowTop + 3, swatchSize, swatchSize),
+        Paint()..color = color,
+      );
+      rowPainters[index].paint(
+        canvas,
+        Offset(box.left + padding + swatchSize + 6, rowTop),
+      );
+      rowTop += rowHeight;
     }
   }
 
-  (double, double) _lineExtent(
-    List<LinePlotLayer> lines,
-    List<double> Function(LinePlotLayer layer) select, {
-    required bool positiveOnly,
-  }) {
-    var min = double.infinity;
-    var max = double.negativeInfinity;
-    for (final layer in lines) {
-      for (final value in select(layer)) {
-        if (!value.isFinite || (positiveOnly && value <= 0)) {
-          continue;
-        }
-        min = math.min(min, value);
-        max = math.max(max, value);
+  Path _polylinePath(
+    List<double> xs,
+    List<double> ys,
+    _AxisScale xScale,
+    _AxisScale yScale,
+    Rect plotRect,
+  ) {
+    final path = Path();
+    var open = false;
+    final count = math.min(xs.length, ys.length);
+    for (var index = 0; index < count; index++) {
+      final fx = xScale.fraction(xs[index]);
+      final fy = yScale.fraction(ys[index]);
+      if (fx.isNaN || fy.isNaN) {
+        open = false;
+        continue;
+      }
+      final point = Offset(
+        plotRect.left + fx * plotRect.width,
+        plotRect.bottom - fy * plotRect.height,
+      );
+      if (open) {
+        path.lineTo(point.dx, point.dy);
+      } else {
+        path.moveTo(point.dx, point.dy);
+        open = true;
       }
     }
-    if (min > max) {
-      return positiveOnly ? (1e-12, 1.0) : (0.0, 1.0);
+    return path;
+  }
+
+  Path _dashPath(Path source, {double dash = 6.0, double gap = 4.0}) {
+    final result = Path();
+    for (final metric in source.computeMetrics()) {
+      var distance = 0.0;
+      while (distance < metric.length) {
+        final end = math.min(distance + dash, metric.length);
+        result.addPath(metric.extractPath(distance, end), Offset.zero);
+        distance = end + gap;
+      }
     }
-    return (min, max);
+    return result;
   }
 
   _AxisScale _scaleForAxis(
@@ -274,16 +647,20 @@ class _ScenePlotPainter extends CustomPainter {
     return _AxisScale(log: axis.logScale, min: min, max: max);
   }
 
-  void _paintLegend(Canvas canvas, Rect plotRect, List<LinePlotLayer> lines) {
+  void _paintLegend(
+    Canvas canvas,
+    Rect plotRect,
+    List<(String, Color, bool)> entries,
+  ) {
     const swatchWidth = 16.0;
     const rowHeight = 16.0;
     const padding = 8.0;
 
     final painters = <TextPainter>[];
     var maxLabelWidth = 0.0;
-    for (final layer in lines) {
+    for (final (label, _, _) in entries) {
       final painter = TextPainter(
-        text: TextSpan(text: layer.label, style: _sceneLegendStyle),
+        text: TextSpan(text: label, style: _sceneLegendStyle),
         textDirection: TextDirection.ltr,
         maxLines: 1,
         ellipsis: '…',
@@ -293,7 +670,7 @@ class _ScenePlotPainter extends CustomPainter {
     }
 
     final boxWidth = padding * 2 + swatchWidth + 6 + maxLabelWidth;
-    final boxHeight = padding * 2 + rowHeight * lines.length - 4;
+    final boxHeight = padding * 2 + rowHeight * entries.length - 4;
     final box = Rect.fromLTWH(
       plotRect.right - boxWidth - 10,
       plotRect.top + 10,
@@ -311,16 +688,31 @@ class _ScenePlotPainter extends CustomPainter {
         ..style = PaintingStyle.stroke,
     );
 
-    for (var index = 0; index < lines.length; index++) {
+    for (var index = 0; index < entries.length; index++) {
+      final (_, color, dashed) = entries[index];
       final rowTop = box.top + padding + index * rowHeight;
-      canvas.drawLine(
-        Offset(box.left + padding, rowTop + 5),
-        Offset(box.left + padding + swatchWidth, rowTop + 5),
-        Paint()
-          ..color = _layerColor(lines[index])
-          ..strokeWidth = 3
-          ..strokeCap = StrokeCap.round,
-      );
+      final swatchPaint = Paint()
+        ..color = color
+        ..strokeWidth = 3
+        ..strokeCap = StrokeCap.round;
+      if (dashed) {
+        canvas.drawLine(
+          Offset(box.left + padding, rowTop + 5),
+          Offset(box.left + padding + swatchWidth * 0.4, rowTop + 5),
+          swatchPaint,
+        );
+        canvas.drawLine(
+          Offset(box.left + padding + swatchWidth * 0.6, rowTop + 5),
+          Offset(box.left + padding + swatchWidth, rowTop + 5),
+          swatchPaint,
+        );
+      } else {
+        canvas.drawLine(
+          Offset(box.left + padding, rowTop + 5),
+          Offset(box.left + padding + swatchWidth, rowTop + 5),
+          swatchPaint,
+        );
+      }
       painters[index].paint(
         canvas,
         Offset(box.left + padding + swatchWidth + 6, rowTop - 2),
@@ -349,13 +741,11 @@ class _ScenePlotPainter extends CustomPainter {
       return;
     }
 
-    final xScale = _scaleForAxis(
-      scene.xAxis,
-      () => (layer.x0, layer.x0 + layer.dx * layer.width),
-      () => (
-        math.max(layer.x0, layer.dx * 0.5),
-        layer.x0 + layer.dx * layer.width,
-      ),
+    final xScale = _sceneXScaleFor(
+      scene: scene,
+      references: references,
+      fitReferences: fitReferences,
+      xViewport: xViewport,
     );
     final yScale = _scaleForAxis(
       scene.yAxis,
@@ -459,6 +849,45 @@ class _ScenePlotPainter extends CustomPainter {
     _paintGridAndTicks(canvas, plotRect, xScale, yScale, gridLines: false);
     _paintAxisTitles(canvas, size, plotRect, rightLimit: plotRect.right);
     _paintColorbar(canvas, plotRect, zMin: zMin, zMax: zMax, logZ: logZ);
+    _paintHeatmapCursor(canvas, plotRect, layer, xScale, yScale);
+  }
+
+  void _paintHeatmapCursor(
+    Canvas canvas,
+    Rect plotRect,
+    HeatmapPlotLayer layer,
+    _AxisScale xScale,
+    _AxisScale yScale,
+  ) {
+    final position = cursor;
+    if (position == null || !plotRect.contains(position)) {
+      return;
+    }
+    final dataX = xScale.invert(
+      (position.dx - plotRect.left) / plotRect.width,
+    );
+    final dataY = yScale.invert(
+      (plotRect.bottom - position.dy) / plotRect.height,
+    );
+    final column = layer.dx == 0
+        ? -1
+        : ((dataX - layer.x0) / layer.dx).floor();
+    final row = layer.dy == 0 ? -1 : ((dataY - layer.y0) / layer.dy).floor();
+
+    final header = <String>[
+      'x: ${formatReadoutValue(dataX)}'
+          '${scene.xAxis.unit == null ? '' : ' ${scene.xAxis.unit}'}',
+      'y: ${formatReadoutValue(dataY)}'
+          '${scene.yAxis.unit == null ? '' : ' ${scene.yAxis.unit}'}',
+      if (column >= 0 &&
+          column < layer.width &&
+          row >= 0 &&
+          row < layer.height)
+        'z: ${formatReadoutValue(layer.valueAt(column, row))}',
+    ];
+
+    _paintCrosshair(canvas, plotRect, position.dx, position.dy);
+    _paintReadout(canvas, plotRect, position, header, const []);
   }
 
   void _paintColorbar(
@@ -740,6 +1169,125 @@ class _ScenePlotPainter extends CustomPainter {
     }
     painter.paint(canvas, target);
   }
+}
+
+const _colorbarGap = 14.0;
+const _colorbarWidth = 12.0;
+
+/// The drawable plot area of a scene inside a [ScenePlotView] of `size`
+/// (heatmaps reserve room for the colorbar on the right).
+Rect _scenePlotRectFor(PlotSceneData scene, Size size) {
+  final isHeatmap =
+      scene.plotKind == 'heatmap2d' && scene.firstHeatmapLayer != null;
+  final rightInset = isHeatmap ? _colorbarGap + _colorbarWidth + 58.0 : 22.0;
+  return Rect.fromLTRB(78, 40, size.width - rightInset, size.height - 46);
+}
+
+/// The effective x scale of a scene: zoom viewport wins, then a manual axis
+/// range, then the data extent. Shared between the painter and the widget's
+/// gesture handling so brush selections invert consistently.
+_AxisScale _sceneXScaleFor({
+  required PlotSceneData scene,
+  required List<ReferenceTrace> references,
+  required bool fitReferences,
+  required (double, double)? xViewport,
+}) {
+  final axis = scene.xAxis;
+  if (xViewport != null && xViewport.$2 > xViewport.$1) {
+    return _AxisScale(log: axis.logScale, min: xViewport.$1, max: xViewport.$2);
+  }
+  if (axis.hasRange && !(axis.logScale && axis.rangeMin! <= 0)) {
+    return _AxisScale(log: axis.logScale, min: axis.rangeMin!, max: axis.rangeMax!);
+  }
+
+  final heatmap =
+      scene.plotKind == 'heatmap2d' ? scene.firstHeatmapLayer : null;
+  if (heatmap != null) {
+    final min = axis.logScale
+        ? math.max(heatmap.x0, heatmap.dx * 0.5)
+        : heatmap.x0;
+    return _AxisScale(
+      log: axis.logScale,
+      min: min,
+      max: heatmap.x0 + heatmap.dx * heatmap.width,
+    );
+  }
+
+  final lines = scene.lineLayers.toList();
+  final hasLineData =
+      lines.isNotEmpty && lines.any((layer) => layer.xs.isNotEmpty);
+  final includeReferences = fitReferences || !hasLineData;
+  final xsLists = [
+    for (final layer in lines) layer.xs,
+    if (includeReferences) for (final trace in references) trace.xs,
+  ];
+  final (min, max) = _valuesExtentOf(xsLists, positiveOnly: axis.logScale);
+  return _AxisScale(log: axis.logScale, min: min, max: max);
+}
+
+(double, double) _valuesExtentOf(
+  List<List<double>> valueLists, {
+  required bool positiveOnly,
+}) {
+  var min = double.infinity;
+  var max = double.negativeInfinity;
+  for (final values in valueLists) {
+    for (final value in values) {
+      if (!value.isFinite || (positiveOnly && value <= 0)) {
+        continue;
+      }
+      min = math.min(min, value);
+      max = math.max(max, value);
+    }
+  }
+  if (min > max) {
+    return positiveOnly ? (1e-12, 1.0) : (0.0, 1.0);
+  }
+  return (min, max);
+}
+
+/// Index of the sample nearest to `target` in monotonically non-decreasing
+/// `xs` (binary search), or -1 for an empty list.
+int nearestIndexForX(List<double> xs, double target) {
+  if (xs.isEmpty) {
+    return -1;
+  }
+  if (target <= xs.first) {
+    return 0;
+  }
+  if (target >= xs.last) {
+    return xs.length - 1;
+  }
+  var low = 0;
+  var high = xs.length - 1;
+  while (high - low > 1) {
+    final mid = (low + high) ~/ 2;
+    if (xs[mid] <= target) {
+      low = mid;
+    } else {
+      high = mid;
+    }
+  }
+  return (target - xs[low]).abs() <= (xs[high] - target).abs() ? low : high;
+}
+
+/// Cursor-readout number format: scientific notation when |value| < 1e-2 or
+/// >= 1e4, plain decimals otherwise.
+String formatReadoutValue(double value) {
+  if (!value.isFinite) {
+    return '—';
+  }
+  if (value == 0) {
+    return '0';
+  }
+  final absValue = value.abs();
+  if (absValue < 1e-2 || absValue >= 1e4) {
+    return value.toStringAsExponential(3);
+  }
+  if (absValue >= 100) {
+    return value.toStringAsFixed(1);
+  }
+  return value.toStringAsFixed(3);
 }
 
 /// Dark blue → cyan → yellow → red ramp used for heatmap cells.

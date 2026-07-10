@@ -17,6 +17,61 @@ class SessionFormatException implements Exception {
   String toString() => message;
 }
 
+/// Reference-plot display state persisted with the session (the figure
+/// itself stays in its own `.ddref.json` file, referenced by path).
+class SessionReference {
+  const SessionReference({
+    required this.path,
+    required this.colorIndex,
+    required this.visible,
+  });
+
+  final String path;
+  final int colorIndex;
+  final bool visible;
+
+  Map<String, Object?> toJson() => {
+    'path': path,
+    'color': colorIndex,
+    'visible': visible,
+  };
+
+  factory SessionReference.fromJson(Map<String, dynamic> json) {
+    return SessionReference(
+      path: json['path'] as String? ?? '',
+      colorIndex: (json['color'] as num?)?.toInt() ?? 0,
+      visible: json['visible'] as bool? ?? true,
+    );
+  }
+}
+
+/// Live deck-refresh state persisted with the session.
+class SessionLiveConfig {
+  const SessionLiveConfig({
+    this.enabled = false,
+    this.intervalSeconds = 10,
+    this.followNow = true,
+  });
+
+  final bool enabled;
+  final int intervalSeconds;
+  final bool followNow;
+
+  Map<String, Object?> toJson() => {
+    'enabled': enabled,
+    'interval_s': intervalSeconds,
+    'follow_now': followNow,
+  };
+
+  factory SessionLiveConfig.fromJson(Map<String, dynamic> json) {
+    return SessionLiveConfig(
+      enabled: json['enabled'] as bool? ?? false,
+      intervalSeconds: (json['interval_s'] as num?)?.toInt() ?? 10,
+      followNow: json['follow_now'] as bool? ?? true,
+    );
+  }
+}
+
 class WorkspaceSession {
   const WorkspaceSession({
     required this.sourceUris,
@@ -25,6 +80,8 @@ class WorkspaceSession {
     required this.gridColumns,
     required this.gridRows,
     required this.deck,
+    this.references = const [],
+    this.live = const SessionLiveConfig(),
   });
 
   final List<String> sourceUris;
@@ -35,6 +92,10 @@ class WorkspaceSession {
 
   /// Fresh entries (no computed figures); safe to hand to the controller.
   final List<AnalysisDeckEntry> deck;
+
+  /// Additive optional fields (absent in early v1 sessions).
+  final List<SessionReference> references;
+  final SessionLiveConfig live;
 
   Map<String, Object?> toJson() {
     return {
@@ -52,8 +113,14 @@ class WorkspaceSession {
             'label': entry.label,
             'channels': entry.channelIds,
             'spec': entry.spec,
+            'expression': ?entry.expression,
           },
       ],
+      if (references.isNotEmpty)
+        'references': [
+          for (final reference in references) reference.toJson(),
+        ],
+      'live': live.toJson(),
     };
   }
 
@@ -87,6 +154,16 @@ class WorkspaceSession {
         for (final raw in json['deck'] as List<dynamic>? ?? const [])
           _deckEntryFromJson(raw),
       ],
+      references: [
+        for (final raw in json['references'] as List<dynamic>? ?? const [])
+          if (raw is Map)
+            SessionReference.fromJson(Map<String, dynamic>.from(raw)),
+      ],
+      live: json['live'] is Map
+          ? SessionLiveConfig.fromJson(
+              Map<String, dynamic>.from(json['live'] as Map),
+            )
+          : const SessionLiveConfig(),
     );
   }
 }
@@ -104,6 +181,7 @@ AnalysisDeckEntry _deckEntryFromJson(Object? raw) {
     spec: json['spec'] is Map
         ? Map<String, Object?>.from(json['spec'] as Map)
         : <String, Object?>{},
+    expression: json['expression'] as String?,
   );
 }
 

@@ -56,10 +56,19 @@ class PlotAxis {
           : null,
     );
   }
+
+  Map<String, Object?> toJson() => {
+    'label': label,
+    'unit': unit,
+    'log_scale': logScale,
+    'range': hasRange ? [rangeMin, rangeMax] : null,
+  };
 }
 
 abstract class PlotLayerData {
   const PlotLayerData();
+
+  Map<String, Object?> toJson();
 
   factory PlotLayerData.fromJson(Map<String, dynamic> json) {
     switch (json['kind']) {
@@ -110,6 +119,15 @@ class LinePlotLayer extends PlotLayerData {
 
   /// `[r, g, b, a]` components in 0..1.
   final List<double> colorRgba;
+
+  @override
+  Map<String, Object?> toJson() => {
+    'kind': 'line',
+    'label': label,
+    'xs': xs,
+    'ys': ys,
+    'color_rgba': colorRgba,
+  };
 }
 
 /// Heatmap cells positioned on real axes; `values` is column-major
@@ -134,6 +152,18 @@ class HeatmapPlotLayer extends PlotLayerData {
   final List<double> values;
 
   double valueAt(int column, int row) => values[column * height + row];
+
+  @override
+  Map<String, Object?> toJson() => {
+    'kind': 'heatmap',
+    'width': width,
+    'height': height,
+    'x0': x0,
+    'dx': dx,
+    'y0': y0,
+    'dy': dy,
+    'values': values,
+  };
 }
 
 class VolumePlotLayer extends PlotLayerData {
@@ -148,6 +178,15 @@ class VolumePlotLayer extends PlotLayerData {
   final int yLen;
   final int zLen;
   final List<double> values;
+
+  @override
+  Map<String, Object?> toJson() => {
+    'kind': 'volume',
+    'x_len': xLen,
+    'y_len': yLen,
+    'z_len': zLen,
+    'values': values,
+  };
 }
 
 class PlotSceneData {
@@ -199,6 +238,17 @@ class PlotSceneData {
           .toList(),
     );
   }
+
+  Map<String, Object?> toJson() => {
+    'title': title,
+    'plot_kind': plotKind,
+    'x_axis': xAxis.toJson(),
+    'y_axis': yAxis.toJson(),
+    'z_axis': zAxis?.toJson(),
+    'epoch_ns': epochNs,
+    'time_range': timeRange?.toJson(),
+    'layers': [for (final layer in layers) layer.toJson()],
+  };
 
   Iterable<LinePlotLayer> get lineLayers => layers.whereType<LinePlotLayer>();
 
