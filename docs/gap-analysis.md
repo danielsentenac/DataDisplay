@@ -136,16 +136,53 @@ TIME, FFT, FFTTIME, COHERENCE, TRFCT, BRMSTIME each expose the original's key co
   export on olserver38); Flutter controller keeps a single active source (multi-source sessions
   reopen only the first URI, with warnings).
 
-### Phase E — Input completion
-FrSerData (`ser`/SMS) reads in dd-io-gwf; HDF5 MinMax aggregation; decide the online story
-(keep Tomcat Java tier as the sole live bridge vs a native Rust FdShm reader for on-site use);
-reference plots (save series to HDF5, superpose with per-ref color).
+### Phase E — Input completion — DONE 2026-07-08
+- ✅ FrSerData (`ser`/SMS) reads in dd-io-gwf: stations expand to per-variable
+  `ser/STATION.VARIABLE` catalog entries (variables and `units` annotations discovered from the
+  first frame's record, FrameL `FrSerDataReadT` under the hood); reads return Series1D on an
+  irregular axis (one sample per distinct record, repeated rebroadcasts deduplicated), with
+  real units. Validated e2e against a real Virgo SMS station (V1:ENV_CEB_SEIS_N_50Hz_rms).
+- ✅ Found and fixed in the process: FrameL keeps global static state, so all native calls are
+  now serialized behind one process-wide lock (`framel_files()`); a per-reader mutex was not
+  enough and parallel engines corrupted each other's reads.
+- ✅ HDF5 MinMax aggregation: `min_max_envelope` in dd-processing returns SampledData with
+  sample shape `[2]` (interleaved min/max per bucket).
+- **Online-data decision**: the Tomcat Java tier stays the sole live bridge. Rationale: the
+  rewrite's goals are Cm-free and cross-platform — Windows/macOS clients cannot map Virgo
+  shared memory regardless, and the Tomcat backend already decodes FdShm/Zfd live streams
+  server-side (reused dataviewer classes) behind plain HTTP. A native on-site FdShm adapter
+  remains possible later behind the same `DataSource` trait (a `dd-io-shm` crate slot) if
+  latency profiling ever demands it; nothing in the architecture forecloses it.
+- ✅ Shell: reference plots — freeze any computed line figure to a `.ddref.json`
+  (`lib/src/reference_plots.dart`), manage in an Analysis "Reference plots" panel
+  (load, 8-color palette, show/hide, remove, "Fit references" autoscale toggle), superposed
+  dashed with "(ref)" legend suffix on x-unit-compatible line scenes only; persisted in
+  sessions (additive, tolerant of old files).
+- ✅ Shell: live deck refresh — Live toggle + 5/10/30/60 s interval + "follow now" sliding
+  GPS window (duration preserved, 30 s latency margin, `gpsNowSeconds` = unix − 315964800
+  + 18 leap s) recomputing all deck entries sequentially with overlap-skip; live config
+  persisted in sessions; restoring a live session resumes the loop after the restore compute.
+  Still open: dy.cfg import of FFTTIME time-resolution stays approximated; live loop timer
+  itself untested (window math unit-tested); references restricted to line1d targets.
 
-### Phase F — Interaction & advanced parity
-Cursors/readouts, sync-zoom across pads + unzoom-all, superpose/permute/move plot operations,
-log-axis toggles in UI, batch/headless snapshot mode for web monitoring, user-defined channel
-maths via a Rust expression engine (e.g. evalexpr/rhai) instead of runtime C compilation,
-trigger/lock gating, 1D/2D distributions, audio playback (rodio/just_audio), GWF re-writing.
+### Phase F — Interaction & advanced parity — DONE 2026-07-10 (with recorded deferrals)
+- ✅ Engine: user-defined channel maths — hand-rolled expression evaluator in dd-processing
+  (`evaluate_expression`: ch0..chN variables, arithmetic incl. `^`, pi/e, 16 one-arg + 4
+  two-arg functions; Pratt parser, per-sample eval, rate check + shortest-length truncation);
+  wired as the optional request-level `expression` on `dd_engine_plot_json` (replaces the
+  original's runtime-compiled C UserOp; single-series plot kinds only).
+- ✅ Engine: 1D/2D distributions — `histogram1d`/`histogram2d` in dd-processing (auto or
+  manual ranges, NaN-safe, degenerate-constant widening); spec kinds `histogram` (multi-trace
+  step curves) and `histogram2d` (value-vs-value heatmap with counts color scale).
+- ✅ Shell: "Combine channels" expression field (up to 4 channels via C/D pickers; expression
+  travels as a request-level key, persisted in deck entries and sessions); 1D/2D distribution
+  plot kinds with bins/range/log controls; hover + pinned cursors with per-trace readouts
+  (line scenes and heatmap cells, references included); brush sync-zoom shared across
+  same-x-unit deck cells with per-cell Unzoom and deck-level Unzoom all (view-level only,
+  no recompute; zoom state not persisted).
+- Deferred (recorded, not started): batch/headless snapshot CLI for web monitoring (a
+  `dd-snapshot` bin rendering scenes to PNG, e.g. via plotters), trigger/ITF-lock gating
+  (can ride on the expression engine as a gate condition), audio playback, GWF re-writing.
 
 ### Suggested immediate next actions
 - Commit the two uncommitted dd-io-gwf diagnostic changes.

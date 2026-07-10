@@ -37,7 +37,7 @@ Current implementation notes:
 - Linux desktop builds now package `dd-ffi` automatically into the Flutter bundle, and Windows/macOS build hooks are in place for the same flow
 - the `HDF5` crate now opens real `.h5` files through a pure-Rust reader and maps discovered datasets into neutral stream descriptors
 - the adapter still supports registered in-memory layouts for focused tests and future custom mappings
-- the `GWF` crate now has a real `FrameReader` boundary plus first-pass native local Frame support for `adc`, `proc`, and `sim`; `ser` streams are cataloged but still metadata-only
+- the `GWF` crate now has a real `FrameReader` boundary plus native local Frame support for `adc`, `proc`, `sim`, and `ser` (slow-monitoring stations expand to per-variable `ser/STATION.VARIABLE` channels with units); all FrameL calls are serialized behind a process-wide lock
 - `dd-processing` is a real DSP core: Welch PSD/ASD (mean/median/decay averaging), coherence, transfer functions, FFT spectrograms, BRMS, Butterworth filtering, zero-phase filtfilt, anti-aliased decimation — numerically validated by 24 tests
 - the shell has an **Analysis** section driven by `dd_engine_plot_json`: FFT/spectrogram/coherence/transfer-function/BRMS/time plots are computed in Rust and rendered generically by `ScenePlotView` from `dd-render` scenes
 
