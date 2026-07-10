@@ -8,13 +8,17 @@
 mod brms;
 mod cross;
 mod error;
+mod expr;
 mod filter;
+mod histogram;
 mod segment;
 mod spectrogram;
 mod spectrum;
 mod window;
 
 pub use brms::{brms, BrmsParams};
+pub use expr::evaluate_expression;
+pub use histogram::{histogram1d, histogram2d, Histogram1D};
 pub use cross::{
     coherence, cross_analysis, phase_to_delay, transfer_function, CrossAnalysis, CrossParams,
     TransferFunction,

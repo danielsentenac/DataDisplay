@@ -3,8 +3,9 @@
 mod plot;
 
 pub use plot::{
-    BrmsPlotSpec, CrossPlotSpec, FfiAxisSpec, FfiPlotLayer, FfiPlotScene, PlotChannelRef,
-    PlotRequest, PlotResponse, PlotSpec, SpectrogramPlotSpec, SpectrumPlotSpec, TimePlotSpec,
+    BrmsPlotSpec, CrossPlotSpec, FfiAxisSpec, FfiPlotLayer, FfiPlotScene, Histogram2dPlotSpec,
+    HistogramPlotSpec, PlotChannelRef, PlotRequest, PlotResponse, PlotSpec, SpectrogramPlotSpec,
+    SpectrumPlotSpec, TimePlotSpec,
 };
 
 use std::collections::BTreeMap;

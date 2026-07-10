@@ -46,6 +46,12 @@ pub struct PlotRequest {
     pub channels: Vec<PlotChannelRef>,
     pub time_range: FfiTimeRange,
     pub spec: PlotSpec,
+    /// Channel maths applied before plotting (the original's "Combine
+    /// Channels" UserOp): an expression over `ch0`..`chN` referencing the
+    /// listed channels, e.g. `ch0 - 2*ch1`. The result becomes the single
+    /// input series; not valid for two-channel (cross/histogram2d) plots.
+    #[serde(default)]
+    pub expression: Option<String>,
     #[serde(default)]
     pub allow_gaps: bool,
 }
@@ -59,6 +65,42 @@ pub enum PlotSpec {
     Coherence(CrossPlotSpec),
     TransferFunction(CrossPlotSpec),
     Brms(BrmsPlotSpec),
+    Histogram(HistogramPlotSpec),
+    Histogram2d(Histogram2dPlotSpec),
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct HistogramPlotSpec {
+    #[serde(default = "default_bins")]
+    pub bins: usize,
+    #[serde(default)]
+    pub x_min: Option<f64>,
+    #[serde(default)]
+    pub x_max: Option<f64>,
+    #[serde(default)]
+    pub log_y: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct Histogram2dPlotSpec {
+    #[serde(default = "default_bins")]
+    pub x_bins: usize,
+    #[serde(default = "default_bins")]
+    pub y_bins: usize,
+    #[serde(default)]
+    pub x_min: Option<f64>,
+    #[serde(default)]
+    pub x_max: Option<f64>,
+    #[serde(default)]
+    pub y_min: Option<f64>,
+    #[serde(default)]
+    pub y_max: Option<f64>,
+    #[serde(default = "default_true")]
+    pub log_z: bool,
+}
+
+fn default_bins() -> usize {
+    100
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Default)]
@@ -571,11 +613,31 @@ pub(crate) fn execute(
         ));
     }
     let time_range = request.time_range.into_domain()?;
-    let series: Vec<Series1D> = request
+    let mut series: Vec<Series1D> = request
         .channels
         .iter()
         .map(|channel| read_series(engine, channel, &time_range, request.allow_gaps))
         .collect::<EngineResult<_>>()?;
+
+    if let Some(expression) = request
+        .expression
+        .as_ref()
+        .map(|text| text.trim())
+        .filter(|text| !text.is_empty())
+    {
+        if matches!(
+            request.spec,
+            PlotSpec::Coherence(_) | PlotSpec::TransferFunction(_) | PlotSpec::Histogram2d(_)
+        ) {
+            return Err(EngineError::invalid_query(
+                "channel expressions are not supported for two-channel plots",
+            ));
+        }
+        let refs: Vec<&Series1D> = series.iter().collect();
+        let combined =
+            dd_processing::evaluate_expression(expression, &refs).map_err(processing_error)?;
+        series = vec![combined];
+    }
 
     let (title, scenes) = match &request.spec {
         PlotSpec::Time(spec) => plot_time(&series, spec)?,
@@ -593,6 +655,11 @@ pub(crate) fn execute(
             plot_transfer_function(&series[0], &series[1], spec)?
         }
         PlotSpec::Brms(spec) => plot_brms(&series, spec)?,
+        PlotSpec::Histogram(spec) => plot_histogram(&series, spec)?,
+        PlotSpec::Histogram2d(spec) => {
+            expect_channels(&request, 2, "2D distribution")?;
+            plot_histogram2d(&series[0], &series[1], spec)?
+        }
     };
 
     Ok(PlotResponse {
@@ -837,6 +904,117 @@ fn plot_transfer_function(
     Ok((title, vec![module, second]))
 }
 
+fn plot_histogram(
+    series: &[Series1D],
+    spec: &HistogramPlotSpec,
+) -> EngineResult<(String, Vec<PlotScene>)> {
+    let mut layers = Vec::with_capacity(series.len());
+    let mut y_max: f64 = 0.0;
+    let mut x_range: Option<(f64, f64)> = None;
+    for (index, one) in series.iter().enumerate() {
+        let histogram = dd_processing::histogram1d(one, spec.bins, spec.x_min, spec.x_max)
+            .map_err(processing_error)?;
+        // Step curve: two points per bin.
+        let mut xs = Vec::with_capacity(2 * histogram.counts.len());
+        let mut ys = Vec::with_capacity(2 * histogram.counts.len());
+        for (bin, count) in histogram.counts.iter().enumerate() {
+            let left = histogram.start + histogram.bin_width * bin as f64;
+            xs.push(left);
+            ys.push(*count);
+            xs.push(left + histogram.bin_width);
+            ys.push(*count);
+            y_max = y_max.max(*count);
+        }
+        let end = histogram.start + histogram.bin_width * histogram.counts.len() as f64;
+        x_range = Some(match x_range {
+            Some((low, high)) => (low.min(histogram.start), high.max(end)),
+            None => (histogram.start, end),
+        });
+        layers.push(PlotLayer::Line(dd_render::LineLayer {
+            label: one.channel.display_name.clone(),
+            xs,
+            ys,
+            color_rgba: dd_render::default_color(index),
+        }));
+    }
+
+    let title = format!("Distribution {}", channel_names(series));
+    let x_unit = series.iter().find_map(|one| one.channel.unit.clone());
+    let scene = PlotScene {
+        title: title.clone(),
+        kind: dd_render::PlotKind::Line1D,
+        x_axis: AxisSpec::new("Value").with_unit(x_unit).with_range(x_range),
+        y_axis: AxisSpec::new("Counts")
+            .with_log(spec.log_y)
+            .with_range(Some((0.0, y_max.max(1.0)))),
+        z_axis: None,
+        epoch_ns: None,
+        time_range: None,
+        layers,
+    };
+    Ok((title, vec![scene]))
+}
+
+fn plot_histogram2d(
+    a: &Series1D,
+    b: &Series1D,
+    spec: &Histogram2dPlotSpec,
+) -> EngineResult<(String, Vec<PlotScene>)> {
+    let grid = dd_processing::histogram2d(
+        a,
+        b,
+        spec.x_bins,
+        spec.y_bins,
+        spec.x_min,
+        spec.x_max,
+        spec.y_min,
+        spec.y_max,
+    )
+    .map_err(processing_error)?;
+
+    let parse = |key: &str| {
+        grid.metadata
+            .get(key)
+            .and_then(|value| value.parse::<f64>().ok())
+            .unwrap_or(0.0)
+    };
+    let (x0, dx) = (parse("dd_x_origin"), parse("dd_x_step"));
+    let (y0, dy) = (parse("dd_y_origin_hz"), parse("dd_y_step_hz"));
+    let z_max = grid.values.iter().cloned().fold(0.0f32, f32::max) as f64;
+
+    let title = format!(
+        "2D distribution {} vs {}",
+        b.channel.display_name, a.channel.display_name
+    );
+    let scene = PlotScene {
+        title: title.clone(),
+        kind: dd_render::PlotKind::Heatmap2D,
+        x_axis: AxisSpec::new(a.channel.display_name.clone())
+            .with_unit(a.channel.unit.clone())
+            .with_range(Some((x0, x0 + dx * grid.width as f64))),
+        y_axis: AxisSpec::new(b.channel.display_name.clone())
+            .with_unit(b.channel.unit.clone())
+            .with_range(Some((y0, y0 + dy * grid.height as f64))),
+        z_axis: Some(
+            AxisSpec::new("Counts")
+                .with_log(spec.log_z)
+                .with_range(Some((0.0, z_max.max(1.0)))),
+        ),
+        epoch_ns: None,
+        time_range: None,
+        layers: vec![PlotLayer::Heatmap(dd_render::HeatmapLayer {
+            width: grid.width,
+            height: grid.height,
+            x0,
+            dx,
+            y0,
+            dy,
+            values: grid.values,
+        })],
+    };
+    Ok((title, vec![scene]))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -923,6 +1101,7 @@ mod tests {
                 spec: PlotSpec::Fft(
                     serde_json::from_str(r#"{"segment_len": 1000}"#).unwrap(),
                 ),
+                expression: None,
                 allow_gaps: false,
             })
             .expect("fft plot should succeed");
@@ -956,6 +1135,7 @@ mod tests {
                 spec: PlotSpec::TransferFunction(
                     serde_json::from_str(r#"{"segment_len": 500}"#).unwrap(),
                 ),
+                expression: None,
                 allow_gaps: false,
             })
             .expect("transfer function plot should succeed");
@@ -978,6 +1158,7 @@ mod tests {
                 spec: PlotSpec::Coherence(
                     serde_json::from_str(r#"{"segment_len": 500}"#).unwrap(),
                 ),
+                expression: None,
                 allow_gaps: false,
             })
             .expect("coherence plot should succeed");
@@ -1001,6 +1182,7 @@ mod tests {
                     max_points: Some(100),
                     ..TimePlotSpec::default()
                 }),
+                expression: None,
                 allow_gaps: false,
             })
             .expect("time plot should succeed");
@@ -1024,6 +1206,7 @@ mod tests {
                     serde_json::from_str(r#"{"segment_len": 200, "step_len": 100}"#)
                         .unwrap(),
                 ),
+                expression: None,
                 allow_gaps: false,
             })
             .expect("spectrogram plot should succeed");
@@ -1046,6 +1229,7 @@ mod tests {
             spec: PlotSpec::Coherence(
                 serde_json::from_str(r#"{"segment_len": 500}"#).unwrap(),
             ),
+            expression: None,
             allow_gaps: false,
         });
         assert!(result.is_err());
@@ -1064,6 +1248,7 @@ mod tests {
                     )
                     .unwrap(),
                 ),
+                expression: None,
                 allow_gaps: false,
             })
             .expect("fft plot should succeed");
@@ -1093,6 +1278,7 @@ mod tests {
                 spec: PlotSpec::Coherence(
                     serde_json::from_str(r#"{"segment_len": 500, "sqrt": true}"#).unwrap(),
                 ),
+                expression: None,
                 allow_gaps: false,
             })
             .expect("sqrt coherence should succeed");
@@ -1106,6 +1292,7 @@ mod tests {
                     serde_json::from_str(r#"{"segment_len": 500, "phase_as_delay": true}"#)
                         .unwrap(),
                 ),
+                expression: None,
                 allow_gaps: false,
             })
             .expect("tf with delay pane should succeed");
@@ -1128,6 +1315,7 @@ mod tests {
                     )
                     .unwrap(),
                 ),
+                expression: None,
                 allow_gaps: false,
             })
             .expect("spectrogram plot should succeed");
@@ -1158,6 +1346,7 @@ mod tests {
                     y_max: Some(3.0),
                     ..TimePlotSpec::default()
                 }),
+                expression: None,
                 allow_gaps: false,
             })
             .expect("time plot should succeed");
@@ -1184,6 +1373,7 @@ mod tests {
                     serde_json::from_str(r#"{"segment_len": 500, "shift_b_s": 0.01}"#)
                         .unwrap(),
                 ),
+                expression: None,
                 allow_gaps: false,
             })
             .expect("shifted tf should succeed");
@@ -1196,6 +1386,99 @@ mod tests {
             "phase at 50 Hz: {}",
             ys[25]
         );
+    }
+
+    #[test]
+    fn expression_combines_channels_before_plotting() {
+        let (engine, source_id) = engine_with_sines();
+        // chan.b = 2 * chan.a, so ch1 - 2*ch0 must be identically zero.
+        let response = engine
+            .plot(PlotRequest {
+                channels: vec![channel(source_id, "chan.a"), channel(source_id, "chan.b")],
+                time_range: full_range(),
+                spec: PlotSpec::Time(TimePlotSpec::default()),
+                expression: Some("ch1 - 2*ch0".to_string()),
+                allow_gaps: false,
+            })
+            .expect("expression plot should succeed");
+
+        assert_eq!(response.scenes[0].layers.len(), 1);
+        let FfiPlotLayer::Line { ys, label, .. } = &response.scenes[0].layers[0] else {
+            panic!("expected line layer");
+        };
+        assert_eq!(label, "ch1 - 2*ch0");
+        assert!(ys.iter().all(|value| value.abs() < 1e-9));
+
+        // Expressions are rejected for two-channel plots.
+        let rejected = engine.plot(PlotRequest {
+            channels: vec![channel(source_id, "chan.a"), channel(source_id, "chan.b")],
+            time_range: full_range(),
+            spec: PlotSpec::Coherence(
+                serde_json::from_str(r#"{"segment_len": 500}"#).unwrap(),
+            ),
+            expression: Some("ch0".to_string()),
+            allow_gaps: false,
+        });
+        assert!(rejected.is_err());
+    }
+
+    #[test]
+    fn histogram_of_a_sine_is_edge_peaked_and_symmetric() {
+        let (engine, source_id) = engine_with_sines();
+        let response = engine
+            .plot(PlotRequest {
+                channels: vec![channel(source_id, "chan.a")],
+                time_range: full_range(),
+                spec: PlotSpec::Histogram(
+                    serde_json::from_str(r#"{"bins": 20, "x_min": -1.0, "x_max": 1.0}"#)
+                        .unwrap(),
+                ),
+                expression: None,
+                allow_gaps: false,
+            })
+            .expect("histogram plot should succeed");
+
+        let scene = &response.scenes[0];
+        assert_eq!(scene.x_axis.label, "Value");
+        assert_eq!(scene.y_axis.label, "Counts");
+        let FfiPlotLayer::Line { xs, ys, .. } = &scene.layers[0] else {
+            panic!("expected line layer");
+        };
+        // Step curve: 2 points per bin.
+        assert_eq!(xs.len(), 40);
+        let total: f64 = ys.iter().step_by(2).sum();
+        assert_eq!(total, 8000.0);
+        // A sine's value distribution peaks at the edges, dips in the middle.
+        assert!(ys[0] > ys[18] && ys[38] > ys[20]);
+    }
+
+    #[test]
+    fn histogram2d_correlates_two_channels() {
+        let (engine, source_id) = engine_with_sines();
+        // chan.b = 2 * chan.a: pairs lie on a diagonal line.
+        let response = engine
+            .plot(PlotRequest {
+                channels: vec![channel(source_id, "chan.a"), channel(source_id, "chan.b")],
+                time_range: full_range(),
+                spec: PlotSpec::Histogram2d(
+                    serde_json::from_str(r#"{"x_bins": 10, "y_bins": 10}"#).unwrap(),
+                ),
+                expression: None,
+                allow_gaps: false,
+            })
+            .expect("2d histogram plot should succeed");
+
+        let scene = &response.scenes[0];
+        assert_eq!(scene.plot_kind, "heatmap2d");
+        let FfiPlotLayer::Heatmap { width, height, values, .. } = &scene.layers[0] else {
+            panic!("expected heatmap layer");
+        };
+        assert_eq!((*width, *height), (10, 10));
+        let total: f32 = values.iter().sum();
+        assert_eq!(total, 8000.0);
+        // Off-diagonal cells stay empty for a perfectly correlated pair.
+        assert_eq!(values[0 * height + 9], 0.0);
+        assert!(values[0] > 0.0 && values[9 * height + 9] > 0.0);
     }
 
     #[test]

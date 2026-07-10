@@ -67,6 +67,7 @@ fn fft_of_real_magnetometer_shows_the_mains_line() {
                 )
                 .unwrap(),
             ),
+            expression: None,
             allow_gaps: false,
         })
         .expect("FFT plot of real magnetometer data should succeed");
@@ -206,6 +207,7 @@ fn spectrogram_and_coherence_run_on_real_data() {
                 )
                 .unwrap(),
             ),
+            expression: None,
             allow_gaps: false,
         })
         .expect("spectrogram of real data should succeed");
@@ -235,6 +237,7 @@ fn spectrogram_and_coherence_run_on_real_data() {
             spec: PlotSpec::Coherence(
                 serde_json::from_str(r#"{"segment_duration_s": 2.0}"#).unwrap(),
             ),
+            expression: None,
             allow_gaps: false,
         })
         .expect("self coherence on real data should succeed");
