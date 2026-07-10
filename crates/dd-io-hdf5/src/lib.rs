@@ -18,7 +18,7 @@ use dd_domain::{
     ChannelDescriptor, DataBlock, EventSeries, Grid2D, Metadata, Series1D, TimeAxis, TimeRange,
     Volume3D,
 };
-use dd_processing::{downsample_mean, moving_rms, spectrogram};
+use dd_processing::{downsample_mean, min_max_envelope, moving_rms, spectrogram};
 use hdf5_reader::group::Group;
 use hdf5_reader::{Attribute, Dataset, Datatype, H5Type, Hdf5File};
 
@@ -991,9 +991,8 @@ fn read_series(series: &Series1D, query: &ReadQuery) -> BackendResult<DataBlock>
             step_len,
         } => DataBlock::Grid2D(spectrogram(&clipped, window_len, step_len)),
         Aggregation::MinMax => {
-            return Err(BackendError::unsupported(
-                "min/max aggregation needs a dedicated envelope block and is not implemented yet",
-            ));
+            let bucket_size = bucket_size_for(clipped.len(), query.resolution_hint.as_ref())?;
+            DataBlock::Sampled(min_max_envelope(&clipped, bucket_size))
         }
     };
 
@@ -1394,6 +1393,38 @@ with h5py.File(path, "w") as f:
 
         assert_eq!(series.values, vec![2.5, 4.5, 6.5]);
         assert!(series.is_consistent());
+    }
+
+    #[test]
+    fn min_max_query_returns_envelope() {
+        let factory = Hdf5Factory::new();
+        factory
+            .register_layout("hdf5:///demo/run01.h5", demo_layout())
+            .expect("layout registration should succeed");
+        let source = factory
+            .open(&SourceTarget::new("hdf5:///demo/run01.h5"))
+            .expect("registered source should open");
+
+        let block = source
+            .read(&ReadQuery {
+                channel_id: "LSC.DARM_ERR".to_string(),
+                time_range: TimeRange::new(0, 8),
+                resolution_hint: Some(ResolutionHint { max_points: 4 }),
+                aggregation: Aggregation::MinMax,
+                allow_gaps: false,
+            })
+            .expect("min/max query should succeed");
+
+        let DataBlock::Sampled(envelope) = block else {
+            panic!("expected sampled envelope result");
+        };
+        assert_eq!(envelope.sample_shape, vec![2]);
+        assert!(envelope.is_consistent());
+        // demo series is 0..=7: buckets of 2 -> [min, max] pairs.
+        assert_eq!(
+            envelope.values,
+            vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]
+        );
     }
 
     #[test]

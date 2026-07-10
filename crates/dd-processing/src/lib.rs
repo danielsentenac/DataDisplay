@@ -31,7 +31,7 @@ pub use spectrum::{
 };
 pub use window::Window;
 
-use dd_domain::{Series1D, TimeAxis};
+use dd_domain::{SampleAxis, SampledData, Series1D, TimeAxis};
 
 pub fn downsample_mean(series: &Series1D, bucket_size: usize) -> Series1D {
     if bucket_size <= 1 || series.values.is_empty() {
@@ -69,6 +69,58 @@ pub fn downsample_mean(series: &Series1D, bucket_size: usize) -> Series1D {
         axis,
         values,
         metadata: series.metadata.clone(),
+    }
+}
+
+/// Min/max envelope: one `[min, max]` pair per bucket, as `SampledData` with
+/// sample shape `[2]` (values interleaved `min0, max0, min1, max1, ...`).
+pub fn min_max_envelope(series: &Series1D, bucket_size: usize) -> SampledData {
+    let bucket_size = bucket_size.max(1);
+    let mut values = Vec::with_capacity(2 * series.values.len().div_ceil(bucket_size));
+    for chunk in series.values.chunks(bucket_size) {
+        let mut low = f64::INFINITY;
+        let mut high = f64::NEG_INFINITY;
+        for value in chunk {
+            low = low.min(*value);
+            high = high.max(*value);
+        }
+        values.push(low);
+        values.push(high);
+    }
+    let buckets = values.len() / 2;
+
+    let axis = match &series.axis {
+        TimeAxis::Regular {
+            start_ns,
+            sample_period_ns,
+            ..
+        } => TimeAxis::Regular {
+            start_ns: *start_ns,
+            sample_period_ns: sample_period_ns.saturating_mul(bucket_size as i64),
+            len: buckets,
+        },
+        TimeAxis::Irregular { timestamps_ns } => TimeAxis::Irregular {
+            timestamps_ns: timestamps_ns
+                .iter()
+                .copied()
+                .step_by(bucket_size)
+                .take(buckets)
+                .collect(),
+        },
+    };
+
+    let mut envelope_axis = SampleAxis::new("envelope", 2);
+    envelope_axis.unit = series.channel.unit.clone();
+    let mut metadata = series.metadata.clone();
+    metadata.insert("dd_kind".to_string(), "min_max_envelope".to_string());
+
+    SampledData {
+        channel: series.channel.clone(),
+        axis,
+        sample_shape: vec![2],
+        sample_axes: vec![envelope_axis],
+        values,
+        metadata,
     }
 }
 

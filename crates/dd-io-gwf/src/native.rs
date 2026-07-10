@@ -44,6 +44,26 @@ struct FrFile {
 }
 
 #[repr(C)]
+struct FrTable {
+    _private: [u8; 0],
+}
+
+/// Mirrors FrameL's `struct FrSerData` (slow monitoring station record).
+#[repr(C)]
+struct FrSerData {
+    classe: *mut FrSH,
+    name: *mut c_char,
+    serial: *mut FrVect,
+    table: *mut FrTable,
+    next: *mut FrSerData,
+    next_old: *mut FrSerData,
+    time_sec: c_uint,
+    time_nsec: c_uint,
+    sample_rate: c_double,
+    data: *mut c_char,
+}
+
+#[repr(C)]
 struct FrVect {
     classe: *mut FrSH,
     name: *mut c_char,
@@ -113,17 +133,27 @@ unsafe extern "C" {
     ) -> *mut FrVect;
 
     fn FrVectFree(vect: *mut FrVect);
+
+    fn FrSerDataReadT(i_file: *mut FrFile, name: *mut c_char, gtime: c_double)
+        -> *mut FrSerData;
+    fn FrSerDataFree(ser_data: *mut FrSerData);
 }
 
-pub(super) struct NativeFrameReader {
-    files: Mutex<BTreeMap<String, CachedFrameFile>>,
+/// FrameL keeps global static state (shared buffers, structure dictionaries),
+/// so ALL FrameL calls must be serialized process-wide — a per-reader lock is
+/// not enough when several sources are open. Every native call site runs
+/// under this single cache lock.
+fn framel_files() -> &'static Mutex<BTreeMap<String, CachedFrameFile>> {
+    static FILES: std::sync::OnceLock<Mutex<BTreeMap<String, CachedFrameFile>>> =
+        std::sync::OnceLock::new();
+    FILES.get_or_init(|| Mutex::new(BTreeMap::new()))
 }
+
+pub(super) struct NativeFrameReader;
 
 impl NativeFrameReader {
     pub fn new() -> Self {
-        Self {
-            files: Mutex::new(BTreeMap::new()),
-        }
+        Self
     }
 
     fn with_cached_file<T>(
@@ -131,8 +161,7 @@ impl NativeFrameReader {
         file_path: &str,
         action: impl FnOnce(&CachedFrameFile) -> BackendResult<T>,
     ) -> BackendResult<T> {
-        let mut files = self
-            .files
+        let mut files = framel_files()
             .lock()
             .map_err(|_| BackendError::internal("native GWF file cache lock is poisoned"))?;
         if !files.contains_key(file_path) {
@@ -147,6 +176,12 @@ impl NativeFrameReader {
     }
 }
 
+#[derive(Default)]
+struct SerStationInfo {
+    variables: Vec<SerVariable>,
+    sample_rate_hz: Option<f64>,
+}
+
 struct CachedFrameFile {
     handle: FrameFileHandle,
     preview_window_sec: f64,
@@ -154,6 +189,8 @@ struct CachedFrameFile {
     proc_names: Vec<String>,
     sim_names: Vec<String>,
     ser_names: Vec<String>,
+    /// Per-station variable lists discovered from the first frame's records.
+    ser_info: BTreeMap<String, SerStationInfo>,
 }
 
 impl CachedFrameFile {
@@ -164,6 +201,25 @@ impl CachedFrameFile {
         let proc_names = handle.channel_names(GwfContainerKind::Proc)?;
         let sim_names = handle.channel_names(GwfContainerKind::Sim)?;
         let ser_names = handle.channel_names(GwfContainerKind::Ser)?;
+
+        let mut ser_info = BTreeMap::new();
+        if !ser_names.is_empty() {
+            let first_frame_time = handle
+                .frame_times(0.0, FULL_FILE_WINDOW_SEC)
+                .first()
+                .copied();
+            for station in &ser_names {
+                let info = first_frame_time
+                    .and_then(|t0| handle.read_ser_record(station, t0 + 1.0e-3))
+                    .map(|record| SerStationInfo {
+                        variables: parse_ser_variables(&record.data),
+                        sample_rate_hz: record.sample_rate_hz,
+                    })
+                    .unwrap_or_default();
+                ser_info.insert(station.clone(), info);
+            }
+        }
+
         Ok(Self {
             handle,
             preview_window_sec,
@@ -171,6 +227,7 @@ impl CachedFrameFile {
             proc_names,
             sim_names,
             ser_names,
+            ser_info,
         })
     }
 
@@ -181,6 +238,95 @@ impl CachedFrameFile {
             GwfContainerKind::Sim => &self.sim_names,
             GwfContainerKind::Ser => &self.ser_names,
         }
+    }
+
+    /// Ser channel names expanded to per-variable `STATION.VARIABLE` form;
+    /// stations with no discoverable record stay as bare station names.
+    fn ser_channel_names(&self) -> Vec<String> {
+        let mut names = Vec::new();
+        for station in &self.ser_names {
+            match self.ser_info.get(station) {
+                Some(info) if !info.variables.is_empty() => {
+                    for variable in &info.variables {
+                        names.push(format!("{station}.{}", variable.name));
+                    }
+                }
+                _ => names.push(station.clone()),
+            }
+        }
+        names
+    }
+
+    /// Resolve `STATION.VARIABLE` against the known station names (longest
+    /// prefix wins, so variable names containing dots like `0.1_1Hz` survive).
+    fn split_ser_channel(&self, channel_name: &str) -> Option<(String, String)> {
+        let mut best: Option<&String> = None;
+        for station in &self.ser_names {
+            if channel_name.len() > station.len() + 1
+                && channel_name.starts_with(station.as_str())
+                && channel_name.as_bytes()[station.len()] == b'.'
+                && best.map(|b| station.len() > b.len()).unwrap_or(true)
+            {
+                best = Some(station);
+            }
+        }
+        match best {
+            Some(station) => Some((
+                station.clone(),
+                channel_name[station.len() + 1..].to_string(),
+            )),
+            None => channel_name
+                .rsplit_once('.')
+                .map(|(station, variable)| (station.to_string(), variable.to_string())),
+        }
+    }
+
+    fn ser_variable_unit(&self, station: &str, variable: &str) -> Option<String> {
+        self.ser_info.get(station).and_then(|info| {
+            info.variables
+                .iter()
+                .find(|known| known.name == variable)
+                .and_then(|known| known.unit.clone())
+        })
+    }
+
+    fn ser_entry(&self, series_class: GwfSeriesClass, channel_name: &str) -> GwfChannelEntry {
+        let Some((station, variable)) = self.split_ser_channel(channel_name) else {
+            return metadata_only_entry(
+                series_class,
+                GwfContainerKind::Ser,
+                channel_name,
+                Some(
+                    "station record holds no parseable variables; only whole-station \
+                     metadata is available"
+                        .to_string(),
+                ),
+            );
+        };
+        let sample_rate_hz = self
+            .ser_info
+            .get(&station)
+            .and_then(|info| info.sample_rate_hz);
+
+        let mut channel = base_channel(GwfContainerKind::Ser, channel_name);
+        channel.unit = self.ser_variable_unit(&station, &variable);
+        channel.sample_rate_hz = sample_rate_hz;
+        channel
+            .metadata
+            .insert("gwf.ser_station".to_string(), station.to_string());
+        GwfChannelEntry::scalar_series(
+            channel,
+            series_class,
+            GwfContainerKind::Ser,
+            GwfTemporalMode::FrameSequence,
+            None,
+        )
+        .with_tag("native")
+        .with_tag("ser")
+        .with_extra("gwf.channel_name", channel_name)
+        .with_extra("gwf.ser_station", &station)
+        .with_extra("gwf.read_support", "native")
+        .with_element_type("f64")
     }
 }
 
@@ -219,13 +365,8 @@ impl FrameReader for NativeFrameReader {
                 }
             }
 
-            for channel_name in file.channel_names(GwfContainerKind::Ser) {
-                manifest.add_entry(metadata_only_entry(
-                    series_class,
-                    GwfContainerKind::Ser,
-                    channel_name,
-                    Some("FrSerData direct reads are not implemented yet".to_string()),
-                ));
+            for channel_name in file.ser_channel_names() {
+                manifest.add_entry(file.ser_entry(series_class, &channel_name));
             }
 
             Ok(manifest)
@@ -248,9 +389,18 @@ impl FrameReader for NativeFrameReader {
                 GwfContainerKind::Sim,
                 GwfContainerKind::Ser,
             ] {
-                for channel_name in file.channel_names(kind) {
-                    let fallback_descriptor =
-                        fast_catalog_entry(series_class, kind, channel_name).descriptor(file_path);
+                let names: Vec<String> = match kind {
+                    GwfContainerKind::Ser => file.ser_channel_names(),
+                    _ => file.channel_names(kind).to_vec(),
+                };
+                for channel_name in &names {
+                    let fallback_descriptor = match kind {
+                        GwfContainerKind::Ser => {
+                            file.ser_entry(series_class, channel_name).descriptor(file_path)
+                        }
+                        _ => fast_catalog_entry(series_class, kind, channel_name)
+                            .descriptor(file_path),
+                    };
                     if !fallback_descriptor.matches(query) {
                         continue;
                     }
@@ -308,10 +458,7 @@ impl FrameReader for NativeFrameReader {
     ) -> BackendResult<DataBlock> {
         let (container_kind, channel_name) = parse_channel_id(&query.channel_id)?;
         if container_kind == GwfContainerKind::Ser {
-            return Err(BackendError::unsupported(format!(
-                "channel `{}` is a FrSerData stream; the native reader catalogs it but does not read it yet",
-                query.channel_id
-            )));
+            return self.with_cached_file(file_path, |file| read_ser_series(file, channel_name, query));
         }
 
         self.with_cached_file(file_path, |file| {
@@ -338,6 +485,79 @@ impl FrameReader for NativeFrameReader {
             Ok(interpretation.into_block(channel))
         })
     }
+}
+
+/// Read one slow-monitoring variable (`STATION.VARIABLE`) as a Series1D:
+/// one sample per frame record, on an irregular axis built from the record
+/// collection times.
+fn read_ser_series(
+    file: &CachedFrameFile,
+    channel_name: &str,
+    query: &ReadQuery,
+) -> BackendResult<DataBlock> {
+    let Some((station, variable)) = file.split_ser_channel(channel_name) else {
+        return Err(BackendError::unsupported(format!(
+            "ser channel `{channel_name}` has no `.variable` suffix; per-variable \
+             channels look like `ser/STATION.VARIABLE`"
+        )));
+    };
+    let (station, variable) = (station.as_str(), variable.as_str());
+
+    let start_sec = query.time_range.start_ns as f64 * 1.0e-9;
+    let len_sec = (query.time_range.duration_ns() as f64 * 1.0e-9).max(PREVIEW_WINDOW_MIN_SEC);
+    let frame_times = file.handle.frame_times(start_sec, len_sec);
+    if frame_times.is_empty() {
+        return Err(BackendError::not_found(format!(
+            "no frames overlap the requested window for ser station `{station}`"
+        )));
+    }
+
+    let mut timestamps_ns = Vec::with_capacity(frame_times.len());
+    let mut values = Vec::with_capacity(frame_times.len());
+    let mut sample_rate_hz = None;
+    for frame_time in frame_times {
+        let Some(record) = file.handle.read_ser_record(station, frame_time + 1.0e-3) else {
+            continue;
+        };
+        if timestamps_ns.last() == Some(&record.timestamp_ns) {
+            continue;
+        }
+        let Some(value) = parse_ser_value(&record.data, variable) else {
+            continue;
+        };
+        sample_rate_hz = sample_rate_hz.or(record.sample_rate_hz);
+        timestamps_ns.push(record.timestamp_ns);
+        values.push(value);
+    }
+
+    if values.is_empty() {
+        return Err(BackendError::not_found(format!(
+            "no `{variable}` samples found for ser station `{station}` in the \
+             requested time window"
+        )));
+    }
+
+    let mut channel = base_channel(GwfContainerKind::Ser, channel_name);
+    channel.unit = file.ser_variable_unit(station, variable);
+    channel.sample_rate_hz = sample_rate_hz;
+    channel
+        .metadata
+        .insert("gwf.ser_station".to_string(), station.to_string());
+    let metadata = BTreeMap::from([
+        (
+            "gwf.temporal_mode".to_string(),
+            GwfTemporalMode::FrameSequence.as_str().to_string(),
+        ),
+        ("gwf.element_type".to_string(), "f64".to_string()),
+        ("gwf.ser_station".to_string(), station.to_string()),
+    ]);
+
+    Ok(DataBlock::Series1D(Series1D {
+        channel,
+        axis: TimeAxis::Irregular { timestamps_ns },
+        values,
+        metadata,
+    }))
 }
 
 struct FrameFileHandle {
@@ -467,6 +687,105 @@ impl Drop for FrameFileHandle {
     }
 }
 
+/// Owned copy of one FrSerData record.
+struct SerRecord {
+    timestamp_ns: i64,
+    sample_rate_hz: Option<f64>,
+    data: String,
+}
+
+impl FrameFileHandle {
+    /// GPS start times of the frames overlapping `[start_sec, start_sec + len_sec)`.
+    fn frame_times(&self, start_sec: f64, len_sec: f64) -> Vec<f64> {
+        let raw = unsafe { FrFileIGetFrameInfo(self.raw, start_sec, len_sec) };
+        let Some(info) = FrVectHandle::from_raw(raw) else {
+            return Vec::new();
+        };
+        numeric_values(info.root()).unwrap_or_default()
+    }
+
+    /// The FrSerData record of `station` in the frame containing `gtime`.
+    fn read_ser_record(&self, station: &str, gtime: f64) -> Option<SerRecord> {
+        let name = CString::new(station).ok()?;
+        let raw = unsafe { FrSerDataReadT(self.raw, name.as_ptr() as *mut c_char, gtime) };
+        if raw.is_null() {
+            return None;
+        }
+        let record = unsafe {
+            let ser = &*raw;
+            let data = if ser.data.is_null() {
+                String::new()
+            } else {
+                CStr::from_ptr(ser.data).to_string_lossy().into_owned()
+            };
+            SerRecord {
+                timestamp_ns: ser.time_sec as i64 * 1_000_000_000 + ser.time_nsec as i64,
+                sample_rate_hz: (ser.sample_rate > 0.0).then_some(ser.sample_rate),
+                data,
+            }
+        };
+        unsafe { FrSerDataFree(raw) };
+        Some(record)
+    }
+}
+
+/// One slow-monitoring variable declared in an FrSerData payload.
+#[derive(Clone, Debug, PartialEq)]
+struct SerVariable {
+    name: String,
+    unit: Option<String>,
+}
+
+/// Variables from an FrSerData payload: FrameL stores alternating
+/// `name value` tokens, with `units <unit>` pairs annotating the variables
+/// that follow them (e.g. `units m.s-1 5_15Hz 1.8e-07 1_5Hz 8.1e-07`).
+fn parse_ser_variables(data: &str) -> Vec<SerVariable> {
+    let mut variables: Vec<SerVariable> = Vec::new();
+    let mut current_unit: Option<String> = None;
+    let mut tokens = data.split_ascii_whitespace();
+    while let Some(name) = tokens.next() {
+        let Some(value) = tokens.next() else {
+            break;
+        };
+        if name == "units" {
+            current_unit = Some(value.to_string());
+            continue;
+        }
+        if !variables.iter().any(|known| known.name == name) {
+            variables.push(SerVariable {
+                name: name.to_string(),
+                unit: current_unit.clone(),
+            });
+        }
+    }
+    variables
+}
+
+/// Value of `param` in an FrSerData payload, following FrameL's
+/// `FrSerDataGet0` rules: the token after the name; `x`-prefixed values are
+/// hexadecimal, other letter-prefixed values are parsed after the letter.
+fn parse_ser_value(data: &str, param: &str) -> Option<f64> {
+    let mut tokens = data.split_ascii_whitespace();
+    while let Some(name) = tokens.next() {
+        let value = tokens.next()?;
+        if name != param {
+            continue;
+        }
+        let mut chars = value.chars();
+        let first = chars.next()?;
+        return if first == 'x' {
+            u32::from_str_radix(chars.as_str(), 16)
+                .ok()
+                .map(|hex| hex as f64)
+        } else if first.is_ascii_alphabetic() {
+            chars.as_str().parse::<f64>().ok()
+        } else {
+            value.parse::<f64>().ok()
+        };
+    }
+    None
+}
+
 struct FrVectHandle {
     raw: *mut FrVect,
 }
@@ -539,12 +858,7 @@ fn fast_catalog_entry(
     kind: GwfContainerKind,
     channel_name: &str,
 ) -> GwfChannelEntry {
-    let reason = if kind == GwfContainerKind::Ser {
-        Some("FrSerData direct reads are not implemented yet".to_string())
-    } else {
-        None
-    };
-    metadata_only_entry(series_class, kind, channel_name, reason)
+    metadata_only_entry(series_class, kind, channel_name, None)
 }
 
 fn metadata_only_entry(
@@ -1086,5 +1400,54 @@ fn string_from_ptr_at(ptr: *mut *mut c_char, index: usize) -> Option<String> {
         None
     } else {
         string_from_ptr(unsafe { *ptr.add(index) })
+    }
+}
+
+#[cfg(test)]
+mod ser_tests {
+    use super::{parse_ser_value, parse_ser_variables};
+
+    const DATA: &str = "temp 23.5 pressure 1.2e-7 status x1f mode d3 count 42";
+    // Real Virgo payload shape: `units` pairs annotate the following variables.
+    const SEIS_RMS: &str =
+        "units m.s-1 5_15Hz 1.8471e-07 1_5Hz 8.15635e-07 0.1_1Hz 5.36884e-07";
+
+    #[test]
+    fn variables_come_from_alternating_tokens_with_unit_annotations() {
+        let names: Vec<String> = parse_ser_variables(DATA)
+            .into_iter()
+            .map(|variable| variable.name)
+            .collect();
+        assert_eq!(names, ["temp", "pressure", "status", "mode", "count"]);
+        assert!(parse_ser_variables("").is_empty());
+        // A trailing name with no value is dropped.
+        assert_eq!(parse_ser_variables("a 1 b").len(), 1);
+
+        let seis = parse_ser_variables(SEIS_RMS);
+        assert_eq!(seis.len(), 3);
+        assert_eq!(seis[0].name, "5_15Hz");
+        assert_eq!(seis[0].unit.as_deref(), Some("m.s-1"));
+        assert_eq!(seis[2].name, "0.1_1Hz");
+        assert_eq!(seis[2].unit.as_deref(), Some("m.s-1"));
+    }
+
+    #[test]
+    fn values_parse_from_real_payload_shapes() {
+        assert_eq!(parse_ser_value(SEIS_RMS, "1_5Hz"), Some(8.15635e-07));
+        assert_eq!(parse_ser_value(SEIS_RMS, "0.1_1Hz"), Some(5.36884e-07));
+    }
+
+    #[test]
+    fn values_follow_framel_parsing_rules() {
+        assert_eq!(parse_ser_value(DATA, "temp"), Some(23.5));
+        assert_eq!(parse_ser_value(DATA, "pressure"), Some(1.2e-7));
+        // `x` prefix means hexadecimal.
+        assert_eq!(parse_ser_value(DATA, "status"), Some(31.0));
+        // Other letter prefixes are skipped before parsing.
+        assert_eq!(parse_ser_value(DATA, "mode"), Some(3.0));
+        assert_eq!(parse_ser_value(DATA, "count"), Some(42.0));
+        assert_eq!(parse_ser_value(DATA, "missing"), None);
+        // Names must match whole tokens, not substrings.
+        assert_eq!(parse_ser_value(DATA, "press"), None);
     }
 }
